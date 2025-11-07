@@ -166,8 +166,6 @@ impl MisraGries {
     fn trim_to_capacity(&mut self) {
         if self.entries.len() > self.capacity {
             self.compress_to_capacity();
-        } else {
-            self.rebuild_index();
         }
     }
 

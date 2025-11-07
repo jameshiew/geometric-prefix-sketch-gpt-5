@@ -23,8 +23,8 @@ public API surface minimal.
 | Geometric depth sampling (Horvitz–Thompson rescaling) | ✅ Implemented. | `GpsSketch::add` samples a max depth using XXH3-derived uniform bits and `sample_level_for_hash`; queries rescale by `alpha^(depth-1)`.
 | Deterministic hashing | ✅ Implemented. | `util::deterministic_hash` uses `xxh3_128_with_seed` so shards merge safely.
 | Compressed radix trie with mid-edge mass | ✅ Implemented (see `tree.rs`). | Nodes hold `sum` plus edges with `label` and `mid_sums`. Node promotion depth currently hard-coded at 4 (`PROMOTION_DEPTH`).
-| Heavy-hitter sketches per node | ✅ Optional. | A Misra-Gries summary stores top suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates.
-| Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. HH sketches are merged entry-wise.
+| Heavy-hitter sketches per node | ✅ Optional. | A Misra-Gries summary stores top suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates and merges summaries via `MisraGries::merge_from`.
+| Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. Heavy hitters reuse the Misra-Gries merge so results are order-invariant.
 | Pruning low-signal prefixes | ✅ `prune_by_estimate`. | Recurses through the trie, dropping subtrees once their scaled estimate falls below threshold.
 | Examples/benchmarks | ✅ `examples/` + Criterion benches. | Provide runnable demos and performance harnesses.
 | Accuracy/integration testing | ✅ `tests/accuracy.rs`. | Ensures estimates align with exact counts on random data (with a tolerance for deep prefixes).
@@ -49,18 +49,30 @@ labels with `mid_sums`. Rationale:
 - Compression beyond depth 4 dramatically reduces node count on path-heavy
   datasets (URLs, file paths).
 
-### 2. Deterministic hashing via XXH3
+### 2. Deterministic hashing via XXH3 (and sampler hygiene)
 DESIGN.md left hashing “implementation-specific.” We chose XXH3 (128-bit) for:
 
 - High avalanche quality; minimal bias in sampling levels.
 - Efficient pure-Rust implementation via `xxhash-rust`.
 - Seed control for shard merge compatibility.
 
-### 3. Misra-Gries index map
+Sampling now mirrors the design’s deterministic story exactly:
+
+- For `α = 0.5` (the default), `sample_level_for_hash` uses just the
+  number of leading zeros in the 128-bit hash (`1 + clz(hash)`), capped by the
+  key length. No floating point math, no branches.
+- For general `α`, `probability_to_hash_threshold` converts
+  `α^(ℓ-1)` into a `u128` threshold via f64 mantissa/exponent decomposition, so
+  every shard makes identical keep/drop decisions without the rounding loss of a
+  naïve `probability * u128::MAX as f64` multiply.
+
+### 3. Misra-Gries index map & merges
 Original DESIGN only said “tiny heavy-hitter sketch”. Instead of a multi-row
 Count-Min, we use a Misra-Gries summary with an auxiliary `HashMap` to keep
-updates `O(1)` despite storing arbitrary byte suffixes. This trades tiny extra
-memory (one hash entry per tracked suffix) for predictable speed.
+updates `O(1)` despite storing arbitrary byte suffixes. During shard merges we
+call `MisraGries::merge_from`, which sums shared counters then performs the
+Frequent-algorithm “compress” step to restore capacity, so merge order can’t
+perturb the heavy-hitter winners.
 
 ### 4. Merge strategy
 The first implementation replayed every prefix via `add_raw_sum`, which was
@@ -73,6 +85,8 @@ compressed-edge divergence correctly:
   before recursing into the remainder.
 - Children are cloned only when truly unique; otherwise we recurse into the
   shared node after rescaling the boundary accumulator.
+- Per-node heavy hitters are merged via `MisraGries::merge_from`, keeping the
+  HH summaries deterministic and order-invariant.
 
 This keeps merge cost linear in the number of realized prefixes, guarantees the
 resulting trie stays compressed/canonical, and aligns with DESIGN.md’s “merge by
@@ -93,6 +107,8 @@ added `tests/accuracy.rs`, which:
 - Validates heavy-hitter queries on compressed edges
   (`heavy_hitters_cover_mid_edge_prefixes`) so autocomplete doesn’t break when a
   prefix ends mid-edge.
+- Guards sampler determinism via `alpha_point_five_sampler_matches_leading_zeros`
+  and HH merge determinism via `misra_gries_merge_is_order_invariant`.
 
 This ensures probabilistic behavior matches theory under a representative
 workload.
@@ -117,7 +133,7 @@ To make the crate usable without reading the entire design paper, we added:
 
 1. Configurable promotion depth & arena allocation.
 2. More numerically stable inclusion probabilities (per-depth table).
-3. Alternative heavy-hitter sketches (Count-Min, Misra-Gries) plug-ins.
+3. Alternative heavy-hitter sketches (Count-Min, etc.) plug-ins.
 4. Streaming/backpressure interface for pruning/compaction.
 
 For now, this implementation matches the majority of DESIGN.md’s promises and
