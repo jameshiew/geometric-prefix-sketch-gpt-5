@@ -836,11 +836,66 @@ mod tests {
     }
 
     #[test]
+    fn prune_removes_compressed_subtrees() {
+        let sketch = GpsSketch::default();
+        let keeper = find_key_with_budget_at_least(&sketch, 4);
+        let mut sketch = sketch;
+        sketch.add_raw_sum(b"abcdefghijkl", 1e-6);
+        sketch.add(&keeper, 10.0);
+        assert!(sketch.contains_prefix(&keeper[..1]));
+        let before = sketch.node_count();
+        let removed = sketch.prune_by_estimate(0.5);
+        assert!(removed > 0);
+        assert!(sketch.node_count() < before);
+        assert!(!sketch.contains_prefix("abcdefghijkl"));
+        assert!(sketch.contains_prefix(&keeper[..1]));
+    }
+
+    #[test]
     fn iter_estimates_reports_mid_edge_prefixes() {
         let mut sketch = GpsSketch::default();
         sketch.add_raw_sum(b"abcd", 1.0);
         let entries: HashMap<_, _> = sketch.iter_estimates().collect();
         assert!(entries.contains_key(b"abcd" as &[u8]));
+    }
+
+    #[test]
+    fn iter_estimates_match_raw_traversal() {
+        let mut sketch = GpsSketch::with_seed(0.55, 7);
+        for (i, key) in ["alpha", "alphabet", "alpine", "beta", "betamax", "gamma"]
+            .iter()
+            .enumerate()
+        {
+            sketch.add(key, (i + 1) as f64);
+        }
+
+        let iter_map: HashMap<Vec<u8>, f64> = sketch.iter_estimates().collect();
+        let mut visit_map = HashMap::new();
+        let mut prefix = Vec::new();
+        sketch.visit_raw(&mut prefix, &mut |pref, raw| {
+            let depth = pref.len();
+            let est = raw / inclusion_prob(sketch.alpha(), depth);
+            visit_map.insert(pref.to_vec(), est);
+        });
+
+        assert_eq!(iter_map.len(), visit_map.len());
+        for (k, v) in visit_map {
+            let iter_v = *iter_map
+                .get(&k)
+                .expect("missing prefix from iterator traversal");
+            assert_close(iter_v, v, 1e-9);
+        }
+    }
+
+    #[test]
+    fn contains_prefix_handles_mid_edge() {
+        let sketch = GpsSketch::default();
+        let key = find_key_with_budget_at_least(&sketch, 8);
+        let mut sketch = sketch;
+        sketch.add(&key, 1.0);
+        assert!(sketch.contains_prefix(&key[..4]));
+        assert!(sketch.contains_prefix(&key[..]));
+        assert!(!sketch.contains_prefix("xyz"));
     }
 
     #[test]
@@ -873,10 +928,54 @@ mod tests {
     }
 
     #[test]
+    fn merge_with_heavy_hitters_matches_combined() {
+        let mut left = GpsSketch::with_heavy_hitters(0.5, 0, 4);
+        let mut right = GpsSketch::with_heavy_hitters(0.5, 0, 4);
+        let mut combined = GpsSketch::with_heavy_hitters(0.5, 0, 4);
+        let samples = [
+            ("cat", 5.0),
+            ("car", 3.0),
+            ("cart", 4.0),
+            ("dog", 2.0),
+            ("cape", 1.0),
+        ];
+        for (idx, &(key, weight)) in samples.iter().enumerate() {
+            if idx % 2 == 0 {
+                left.add(key, weight);
+            } else {
+                right.add(key, weight);
+            }
+            combined.add(key, weight);
+        }
+
+        let mut merged = left.clone();
+        merged.merge_from(&right);
+
+        let merged_top = merged.top_completions("ca", 4);
+        let combined_top = combined.top_completions("ca", 4);
+        assert_eq!(merged_top.len(), combined_top.len());
+        for (m, c) in merged_top.iter().zip(combined_top.iter()) {
+            assert_eq!(m.0, c.0);
+            assert_close(m.1, c.1, 1e-9);
+        }
+    }
+
+    #[test]
     fn sampler_can_hit_very_deep_levels() {
         let sketch = GpsSketch::new(0.5);
         let level = sketch.debug_sample_level_from_bits(0);
         assert!(level >= 120);
+    }
+
+    #[test]
+    fn negative_updates_cancel_out() {
+        let sketch = GpsSketch::default();
+        let key = find_key_with_budget_at_least(&sketch, 5);
+        let mut sketch = sketch;
+        sketch.add(&key, 10.0);
+        sketch.add(&key, -10.0);
+        assert_close(sketch.raw_sum_for_test(&key).unwrap_or(0.0), 0.0, 1e-9);
+        assert_close(sketch.total(), 0.0, 1e-9);
     }
 
     #[test]
@@ -893,5 +992,15 @@ mod tests {
         let mut a = GpsSketch::with_heavy_hitters(0.5, 0, 2);
         let b = GpsSketch::with_seed(0.5, 0);
         a.merge_from(&b);
+    }
+
+    fn find_key_with_budget_at_least(sketch: &GpsSketch, min_budget: usize) -> Vec<u8> {
+        for idx in 0..50_000 {
+            let candidate = format!("key-{idx}-payload");
+            if sketch.debug_prefix_budget(candidate.as_bytes()) >= min_budget {
+                return candidate.into_bytes();
+            }
+        }
+        panic!("unable to find key with budget >= {min_budget}");
     }
 }
