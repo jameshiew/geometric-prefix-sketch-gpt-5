@@ -39,8 +39,8 @@ Define
 
 * Sampling distribution over positive integers (L \ge 1):
   [
-  \Pr[L \ge \ell] = q(\ell) = \alpha^{,\ell-1}, \quad
-  \Pr[L=\ell] = (1-\alpha),\alpha^{,\ell-1}.
+\Pr[L \ge \ell] = q(\ell) = \alpha^{\ell-1}, \quad
+\Pr[L=\ell] = (1-\alpha)\,\alpha^{\ell-1}.
   ]
 * For a prefix of length (\ell), we’ll need the factor (q(\ell)).
 

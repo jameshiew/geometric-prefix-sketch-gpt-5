@@ -1,5 +1,5 @@
 //! Using GPS to approximate range counts on integers by treating them as binary
-//! prefixes. This mimics DESGIN.md's "integer range" use case.
+//! prefixes. This mimics DESIGN.md's "integer range" use case.
 
 use geometric_prefix_sketch::GpsSketch;
 

@@ -164,8 +164,39 @@ impl MisraGries {
     }
 
     fn trim_to_capacity(&mut self) {
+        if self.entries.len() > self.capacity {
+            self.compress_to_capacity();
+        } else {
+            self.rebuild_index();
+        }
+    }
+
+    fn rebuild_index(&mut self) {
+        self.index.clear();
+        self.index.reserve(self.entries.len());
+        for (idx, entry) in self.entries.iter().enumerate() {
+            self.index.insert(entry.key.clone(), idx);
+        }
+    }
+
+    pub(crate) fn merge_from(&mut self, other: &MisraGries) {
+        for (key, weight) in other.iter_entries() {
+            if let Some(&idx) = self.index.get(key) {
+                self.entries[idx].weight += weight;
+            } else {
+                self.entries.push(HeavyEntry {
+                    key: key.to_vec(),
+                    weight,
+                });
+            }
+        }
+        self.compress_to_capacity();
+    }
+
+    fn compress_to_capacity(&mut self) {
         const EPS: f64 = 1e-12;
-        if self.entries.len() <= self.capacity {
+        if self.entries.is_empty() {
+            self.index.clear();
             return;
         }
         while self.entries.len() > self.capacity {
@@ -176,24 +207,12 @@ impl MisraGries {
             if !min_weight.is_finite() {
                 break;
             }
-            if min_weight <= 0.0 {
-                self.entries.retain(|entry| entry.weight > EPS);
-            } else {
-                for entry in self.entries.iter_mut() {
-                    entry.weight -= min_weight;
-                }
-                self.entries.retain(|entry| entry.weight > EPS);
+            for entry in self.entries.iter_mut() {
+                entry.weight -= min_weight;
             }
+            self.entries.retain(|entry| entry.weight > EPS);
         }
         self.rebuild_index();
-    }
-
-    fn rebuild_index(&mut self) {
-        self.index.clear();
-        self.index.reserve(self.entries.len());
-        for (idx, entry) in self.entries.iter().enumerate() {
-            self.index.insert(entry.key.clone(), idx);
-        }
     }
 }
 
@@ -356,17 +375,11 @@ where
 pub(crate) fn merge_nodes(dst: &mut Node, src: &Node, heavy_capacity: Option<usize>) {
     dst.sum += src.sum;
     match (&mut dst.heavy, &src.heavy) {
-        (Some(dst_hh), Some(src_hh)) => {
-            for (suffix, weight) in src_hh.iter_entries() {
-                dst_hh.update(suffix, weight);
-            }
-        }
+        (Some(dst_hh), Some(src_hh)) => dst_hh.merge_from(src_hh),
         (None, Some(src_hh)) => {
             if let Some(cap) = heavy_capacity {
                 let mut hh = MisraGries::new(cap);
-                for (suffix, weight) in src_hh.iter_entries() {
-                    hh.update(suffix, weight);
-                }
+                hh.merge_from(src_hh);
                 dst.heavy = Some(hh);
             }
         }

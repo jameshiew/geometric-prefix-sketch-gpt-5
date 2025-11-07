@@ -337,6 +337,10 @@ impl GpsSketch {
         if max_depth == 1 {
             return 1;
         }
+        if (self.alpha - 0.5).abs() < f64::EPSILON {
+            let leading = hash.leading_zeros() as usize;
+            return (1 + leading).min(max_depth);
+        }
         let mut limit = 1;
         let mut prob = 1.0f64;
         for depth in 2..=max_depth {
@@ -664,6 +668,50 @@ mod tests {
         let keys: Vec<_> = tops.into_iter().map(|(k, _)| k).collect();
         assert!(keys.contains(&b"abcdefg"[..].to_vec()));
         assert!(keys.contains(&b"abcdefgh"[..].to_vec()));
+    }
+
+    #[test]
+    fn misra_gries_merge_is_order_invariant() {
+        let mut a = GpsSketch::with_heavy_hitters(0.5, 0, 4);
+        let mut b = GpsSketch::with_heavy_hitters(0.5, 0, 4);
+        for _ in 0..100 {
+            a.add("apricot", 1.0);
+        }
+        for _ in 0..60 {
+            a.add("apple", 1.0);
+        }
+        for _ in 0..55 {
+            b.add("apricot", 1.0);
+        }
+        for _ in 0..70 {
+            b.add("ape", 1.0);
+        }
+
+        let mut m1 = a.clone();
+        m1.merge_from(&b);
+        let mut m2 = b.clone();
+        m2.merge_from(&a);
+
+        let t1 = m1.top_completions("a", 3);
+        let t2 = m2.top_completions("a", 3);
+        assert_eq!(t1.len(), t2.len());
+        for (lhs, rhs) in t1.iter().zip(t2.iter()) {
+            assert_eq!(lhs.0, rhs.0);
+        }
+    }
+
+    #[test]
+    fn alpha_point_five_sampler_matches_leading_zeros() {
+        let sketch = GpsSketch::new(0.5);
+        for bitpos in 0..=128 {
+            let hash = if bitpos == 128 {
+                0
+            } else {
+                1u128 << (127 - bitpos)
+            };
+            let level = sketch.debug_sample_level_from_bits(hash);
+            assert_eq!(level, 1 + bitpos);
+        }
     }
 
     #[test]

@@ -1,7 +1,5 @@
 use xxhash_rust::xxh3::xxh3_128_with_seed;
 
-const HASH_DOMAIN: f64 = u128::MAX as f64;
-
 pub(crate) fn deterministic_hash(bytes: &[u8], seed: u64) -> u128 {
     xxh3_128_with_seed(bytes, seed)
 }
@@ -14,19 +12,24 @@ pub(crate) fn inclusion_prob(alpha: f64, depth: usize) -> f64 {
 }
 
 pub(crate) fn probability_to_hash_threshold(probability: f64) -> u128 {
-    if probability.is_nan() || probability <= 0.0 {
+    if !probability.is_finite() || probability <= 0.0 {
+        return 0;
+    }
+    if probability >= 1.0 {
+        return u128::MAX;
+    }
+    let bits = probability.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i32 - 1023; // unbiased exponent
+    let mant = (bits & ((1u64 << 52) - 1)) | (1u64 << 52); // implicit leading 1
+    let shift = exp + 128 - 52;
+    if shift <= -128 {
         0
-    } else if probability >= 1.0 {
-        u128::MAX
+    } else if shift < 0 {
+        (mant as u128) >> (-shift as u32)
+    } else if shift < 128 {
+        (mant as u128) << (shift as u32)
     } else {
-        let scaled = probability * HASH_DOMAIN;
-        if scaled >= HASH_DOMAIN {
-            u128::MAX
-        } else if scaled <= 0.0 {
-            0
-        } else {
-            scaled as u128
-        }
+        u128::MAX
     }
 }
 
