@@ -1,4 +1,5 @@
 use crate::util::inclusion_prob;
+use std::collections::HashMap;
 
 pub(crate) const PROMOTION_DEPTH: usize = 4;
 
@@ -109,6 +110,7 @@ impl Edge {
 pub(crate) struct SpaceSaving {
     capacity: usize,
     entries: Vec<HeavyEntry>,
+    index: HashMap<Vec<u8>, usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +125,7 @@ impl SpaceSaving {
         Self {
             capacity,
             entries: Vec::with_capacity(capacity),
+            index: HashMap::with_capacity(capacity),
         }
     }
 
@@ -130,15 +133,17 @@ impl SpaceSaving {
         if delta <= 0.0 {
             return;
         }
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key == key) {
-            entry.weight += delta;
+        if let Some(&idx) = self.index.get(key) {
+            self.entries[idx].weight += delta;
             return;
         }
         if self.entries.len() < self.capacity {
-            self.entries.push(HeavyEntry {
+            let entry = HeavyEntry {
                 key: key.to_vec(),
                 weight: delta,
-            });
+            };
+            self.entries.push(entry);
+            self.index.insert(key.to_vec(), self.entries.len() - 1);
             return;
         }
         let (min_idx, min_weight) = self
@@ -148,10 +153,14 @@ impl SpaceSaving {
             .min_by(|(_, a), (_, b)| a.weight.partial_cmp(&b.weight).unwrap())
             .map(|(idx, entry)| (idx, entry.weight))
             .expect("entries non-empty");
-        self.entries[min_idx] = HeavyEntry {
+        let replacement = HeavyEntry {
             key: key.to_vec(),
             weight: min_weight + delta,
         };
+        let old = std::mem::replace(&mut self.entries[min_idx], replacement);
+        self.index.remove(&old.key);
+        self.index
+            .insert(self.entries[min_idx].key.clone(), min_idx);
     }
 
     pub(crate) fn top_k(&self, k: usize) -> Vec<(Vec<u8>, f64)> {
@@ -212,36 +221,6 @@ pub(crate) fn add_inner(
             break;
         }
     }
-}
-
-pub(crate) fn ensure_node<'a>(
-    node: &'a mut Node,
-    prefix: &[u8],
-    heavy_capacity: Option<usize>,
-) -> Option<&'a mut Node> {
-    if prefix.is_empty() {
-        return Some(node);
-    }
-    let mut current = node;
-    let mut depth = 0;
-    while depth < prefix.len() {
-        if depth < PROMOTION_DEPTH {
-            current = current.ensure_unit_child(prefix[depth], heavy_capacity);
-            depth += 1;
-            continue;
-        }
-        let remaining = &prefix[depth..];
-        let edge = ensure_edge(current, remaining, heavy_capacity);
-        let lcp = common_prefix_len(&edge.label, remaining);
-        if lcp < edge.label.len() && lcp == remaining.len() {
-            edge.split(lcp, heavy_capacity);
-            return Some(edge.child.as_mut());
-        }
-        let consume = edge.label.len();
-        depth += consume;
-        current = edge.child.as_mut();
-    }
-    Some(current)
 }
 
 pub(crate) fn locate_raw_sum<'a>(
@@ -321,6 +300,7 @@ pub(crate) fn prune_node(alpha: f64, node: &mut Node, depth: usize, threshold: f
     removed
 }
 
+#[cfg(test)]
 pub(crate) fn visit_raw<F>(node: &Node, prefix: &mut Vec<u8>, f: &mut F)
 where
     F: FnMut(&[u8], f64),
@@ -340,21 +320,41 @@ where
     }
 }
 
-pub(crate) fn visit_heavy<F>(node: &Node, prefix: &mut Vec<u8>, f: &mut F)
-where
-    F: FnMut(&[u8], &SpaceSaving),
-{
-    if let Some(sketch) = &node.heavy {
-        f(prefix, sketch);
+pub(crate) fn merge_nodes(dst: &mut Node, src: &Node, heavy_capacity: Option<usize>) {
+    dst.sum += src.sum;
+    match (&mut dst.heavy, &src.heavy) {
+        (Some(dst_hh), Some(src_hh)) => {
+            for (suffix, weight) in src_hh.iter_entries() {
+                dst_hh.update(suffix, weight);
+            }
+        }
+        (None, Some(src_hh)) => {
+            if let Some(cap) = heavy_capacity {
+                let mut hh = SpaceSaving::new(cap);
+                for (suffix, weight) in src_hh.iter_entries() {
+                    hh.update(suffix, weight);
+                }
+                dst.heavy = Some(hh);
+            }
+        }
+        _ => {}
     }
-    for edge in &node.children {
-        for &byte in &edge.label {
-            prefix.push(byte);
+
+    'outer: for child in &src.children {
+        for existing in &mut dst.children {
+            if existing.label == child.label {
+                for (a, b) in existing.mid_sums.iter_mut().zip(&child.mid_sums) {
+                    *a += b;
+                }
+                merge_nodes(
+                    existing.child.as_mut(),
+                    child.child.as_ref(),
+                    heavy_capacity,
+                );
+                continue 'outer;
+            }
         }
-        visit_heavy(&edge.child, prefix, f);
-        for _ in &edge.label {
-            prefix.pop();
-        }
+        dst.children.push(child.clone());
     }
 }
 

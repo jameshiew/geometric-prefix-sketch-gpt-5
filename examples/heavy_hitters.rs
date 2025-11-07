@@ -1,5 +1,5 @@
 use geometric_prefix_sketch::GpsSketch;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 fn main() {
     let mut rng = StdRng::seed_from_u64(7);

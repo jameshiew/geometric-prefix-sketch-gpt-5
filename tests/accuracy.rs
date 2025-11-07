@@ -1,5 +1,5 @@
 use geometric_prefix_sketch::GpsSketch;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::HashMap;
 
 #[test]

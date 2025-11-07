@@ -26,7 +26,10 @@ fn main() {
     let mut other = GpsSketch::with_seed(0.5, 123);
     other.add("/api/v1/reports", 5.0);
     sketch.merge_from(&other);
-    println!("After merge: /api/v1 estimate = {:.2}", sketch.estimate("/api/v1"));
+    println!(
+        "After merge: /api/v1 estimate = {:.2}",
+        sketch.estimate("/api/v1")
+    );
 
     let removed = sketch.prune_by_estimate(0.5);
     println!("Pruned {} low-signal prefixes", removed);

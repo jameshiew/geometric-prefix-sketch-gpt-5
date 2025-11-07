@@ -7,10 +7,9 @@
 //! past a configurable promotion depth occupy a single node/edge instead of one
 //! heap allocation per byte.
 
-use crate::tree::{
-    Node, PROMOTION_DEPTH, SpaceSaving, add_inner, ensure_edge, ensure_node, locate_node,
-    locate_raw_sum, prune_node, visit_heavy, visit_raw,
-};
+use crate::tree::{Node, add_inner, locate_node, locate_raw_sum, merge_nodes, prune_node};
+#[cfg(test)]
+use crate::tree::{PROMOTION_DEPTH, ensure_edge, visit_raw};
 use crate::util::{HASH128_TO_UNIT, deterministic_hash, inclusion_prob};
 
 /// Geometric Prefix Sketch with deterministic per-key sampling.
@@ -217,22 +216,7 @@ impl GpsSketch {
             self.heavy_capacity, other.heavy_capacity,
             "HH capacity mismatch"
         );
-
-        let mut prefix = Vec::new();
-        other.visit_raw(&mut prefix, &mut |pref, sum| {
-            self.add_raw_sum(pref, sum);
-        });
-
-        if let Some(cap) = self.heavy_capacity {
-            other.visit_heavy(&mut prefix, &mut |pref, sketch| {
-                if let Some(node) = self.ensure_node(pref) {
-                    let hh = node.heavy.get_or_insert_with(|| SpaceSaving::new(cap));
-                    for (suffix, weight) in sketch.iter_entries() {
-                        hh.update(suffix, weight);
-                    }
-                }
-            });
-        }
+        merge_nodes(&mut self.root, &other.root, self.heavy_capacity);
     }
 
     fn raw_sum(&self, prefix: &[u8]) -> Option<(f64, usize)> {
@@ -243,10 +227,32 @@ impl GpsSketch {
         locate_node(&self.root, prefix, 0)
     }
 
-    fn ensure_node(&mut self, prefix: &[u8]) -> Option<&mut Node> {
-        ensure_node(&mut self.root, prefix, self.heavy_capacity)
+    fn collect_estimates(
+        &self,
+        node: &Node,
+        depth: usize,
+        prefix: &mut Vec<u8>,
+        out: &mut Vec<(Vec<u8>, f64)>,
+    ) {
+        let estimate = node.sum / inclusion_prob(self.alpha, depth);
+        out.push((prefix.clone(), estimate));
+        for edge in &node.children {
+            for (i, &byte) in edge.label.iter().enumerate() {
+                prefix.push(byte);
+                let new_depth = depth + i + 1;
+                if i + 1 == edge.label.len() {
+                    self.collect_estimates(&edge.child, new_depth, prefix, out);
+                } else {
+                    let raw = edge.mid_sums[i];
+                    let est = raw / inclusion_prob(self.alpha, new_depth);
+                    out.push((prefix.clone(), est));
+                }
+                prefix.pop();
+            }
+        }
     }
 
+    #[cfg(test)]
     fn add_raw_sum(&mut self, prefix: &[u8], delta: f64) {
         if prefix.is_empty() {
             self.root.sum += delta;
@@ -283,43 +289,12 @@ impl GpsSketch {
         }
     }
 
-    fn collect_estimates(
-        &self,
-        node: &Node,
-        depth: usize,
-        prefix: &mut Vec<u8>,
-        out: &mut Vec<(Vec<u8>, f64)>,
-    ) {
-        let estimate = node.sum / inclusion_prob(self.alpha, depth);
-        out.push((prefix.clone(), estimate));
-        for edge in &node.children {
-            for (i, &byte) in edge.label.iter().enumerate() {
-                prefix.push(byte);
-                let new_depth = depth + i + 1;
-                if i + 1 == edge.label.len() {
-                    self.collect_estimates(&edge.child, new_depth, prefix, out);
-                } else {
-                    let raw = edge.mid_sums[i];
-                    let est = raw / inclusion_prob(self.alpha, new_depth);
-                    out.push((prefix.clone(), est));
-                }
-                prefix.pop();
-            }
-        }
-    }
-
+    #[cfg(test)]
     fn visit_raw<F>(&self, prefix: &mut Vec<u8>, f: &mut F)
     where
         F: FnMut(&[u8], f64),
     {
         visit_raw(&self.root, prefix, f);
-    }
-
-    fn visit_heavy<F>(&self, prefix: &mut Vec<u8>, f: &mut F)
-    where
-        F: FnMut(&[u8], &SpaceSaving),
-    {
-        visit_heavy(&self.root, prefix, f);
     }
 
     fn prefix_budget(&self, key: &[u8]) -> usize {
