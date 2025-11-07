@@ -2,7 +2,9 @@
 //!
 //! This crate implements the sketch described in `DESIGN.md`. The sketch keeps
 //! unbiased prefix aggregates while touching only a geometrically sampled
-//! portion of each key's prefixes, so updates take constant expected time.
+//! portion of each key's prefixes, so updates take constant expected time. It
+//! now also offers optional per-node heavy-hitter summaries (SpaceSaving) so you
+//! can extract likely completions under any prefix.
 
 use xxhash_rust::xxh3::xxh3_128_with_seed;
 
@@ -12,6 +14,7 @@ const HASH128_TO_UNIT: f64 = 1.0 / ((u128::MAX as f64) + 1.0);
 struct Node {
     sum: f64,
     children: Vec<Child>,
+    heavy: Option<SpaceSaving>,
 }
 
 #[derive(Clone, Debug)]
@@ -20,23 +23,22 @@ struct Child {
     node: Box<Node>,
 }
 
-impl Default for Node {
-    fn default() -> Self {
+impl Node {
+    fn new(hh_capacity: Option<usize>) -> Self {
         Self {
             sum: 0.0,
             children: Vec::new(),
+            heavy: hh_capacity.map(SpaceSaving::new),
         }
     }
-}
 
-impl Node {
-    fn ensure_child(&mut self, byte: u8) -> &mut Node {
+    fn ensure_child(&mut self, byte: u8, hh_capacity: Option<usize>) -> &mut Node {
         if let Some(pos) = self.children.iter().position(|child| child.byte == byte) {
             return &mut self.children[pos].node;
         }
         self.children.push(Child {
             byte,
-            node: Box::new(Node::default()),
+            node: Box::new(Node::new(hh_capacity)),
         });
         let idx = self.children.len() - 1;
         &mut self.children[idx].node
@@ -56,6 +58,85 @@ impl Node {
             .map(|child| child.node.node_count())
             .sum::<usize>()
     }
+
+    fn update_heavy_hitters(&mut self, suffix: &[u8], delta: f64) {
+        if delta <= 0.0 {
+            return;
+        }
+        if let Some(sketch) = &mut self.heavy {
+            sketch.update(suffix, delta);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SpaceSaving {
+    capacity: usize,
+    entries: Vec<HeavyEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct HeavyEntry {
+    key: Vec<u8>,
+    weight: f64,
+}
+
+impl SpaceSaving {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "SpaceSaving capacity must be positive");
+        Self {
+            capacity,
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn update(&mut self, key: &[u8], delta: f64) {
+        if delta <= 0.0 {
+            return;
+        }
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key == key) {
+            entry.weight += delta;
+            return;
+        }
+        if self.entries.len() < self.capacity {
+            self.entries.push(HeavyEntry {
+                key: key.to_vec(),
+                weight: delta,
+            });
+            return;
+        }
+        let (min_idx, min_weight) = self
+            .entries
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.weight.partial_cmp(&b.weight).unwrap())
+            .map(|(idx, entry)| (idx, entry.weight))
+            .expect("entries non-empty");
+        self.entries[min_idx] = HeavyEntry {
+            key: key.to_vec(),
+            weight: min_weight + delta,
+        };
+    }
+
+    fn top_k(&self, k: usize) -> Vec<(Vec<u8>, f64)> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let mut items: Vec<_> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.weight))
+            .collect();
+        items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        items.truncate(k.min(items.len()));
+        items
+    }
+
+    fn iter_entries(&self) -> impl Iterator<Item = (&[u8], f64)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.key.as_slice(), entry.weight))
+    }
 }
 
 /// Geometric Prefix Sketch with deterministic per-key sampling.
@@ -64,6 +145,7 @@ pub struct GpsSketch {
     alpha: f64,
     log_alpha: f64,
     hash_seed: u64,
+    heavy_capacity: Option<usize>,
     root: Node,
 }
 
@@ -84,13 +166,29 @@ impl GpsSketch {
     /// Creates a new sketch with an explicit deterministic hash seed.
     /// All sketches that need to merge must share the same seed.
     pub fn with_seed(alpha: f64, hash_seed: u64) -> Self {
+        Self::with_heavy_hitters_internal(alpha, hash_seed, None)
+    }
+
+    /// Creates a sketch with local heavy-hitter tracking of capacity `hh_capacity`
+    /// entries per node (SpaceSaving). Only positive `delta` updates contribute.
+    pub fn with_heavy_hitters(alpha: f64, hash_seed: u64, hh_capacity: usize) -> Self {
+        assert!(hh_capacity > 0, "heavy hitter capacity must be > 0");
+        Self::with_heavy_hitters_internal(alpha, hash_seed, Some(hh_capacity))
+    }
+
+    fn with_heavy_hitters_internal(
+        alpha: f64,
+        hash_seed: u64,
+        heavy_capacity: Option<usize>,
+    ) -> Self {
         assert!(alpha.is_finite());
         assert!(alpha > 0.0 && alpha < 1.0, "alpha must be in (0, 1)");
         Self {
             alpha,
             log_alpha: alpha.ln(),
             hash_seed,
-            root: Node::default(),
+            heavy_capacity,
+            root: Node::new(heavy_capacity),
         }
     }
 
@@ -104,6 +202,11 @@ impl GpsSketch {
         self.hash_seed
     }
 
+    /// Returns the heavy-hitter capacity (if any).
+    pub fn heavy_hitters_capacity(&self) -> Option<usize> {
+        self.heavy_capacity
+    }
+
     /// Adds `delta` to `key`.
     pub fn add<K: AsRef<[u8]>>(&mut self, key: K, delta: f64) {
         if delta == 0.0 {
@@ -113,12 +216,14 @@ impl GpsSketch {
         let key = key.as_ref();
         let limit = self.prefix_budget(key);
         self.root.sum += delta;
+        self.root.update_heavy_hitters(key, delta);
 
         let mut node = &mut self.root;
         for depth in 0..limit {
             let byte = key[depth];
-            node = node.ensure_child(byte);
+            node = node.ensure_child(byte, self.heavy_capacity);
             node.sum += delta;
+            node.update_heavy_hitters(&key[depth + 1..], delta);
         }
     }
 
@@ -128,7 +233,7 @@ impl GpsSketch {
         let depth = prefix.len();
         match self.find_node(prefix) {
             Some(node) => {
-                let q = self.prefix_inclusion_prob(depth);
+                let q = inclusion_prob(self.alpha, depth);
                 node.sum / q
             }
             None => 0.0,
@@ -142,7 +247,7 @@ impl GpsSketch {
 
     /// Removes all data from the sketch.
     pub fn clear(&mut self) {
-        self.root = Node::default();
+        self.root = Node::new(self.heavy_capacity);
     }
 
     /// Number of materialized prefixes (including root).
@@ -163,8 +268,37 @@ impl GpsSketch {
         all.into_iter()
     }
 
+    /// Returns up to `k` heavy-hitter completions under `prefix` (sorted desc by estimate).
+    pub fn top_completions<K: AsRef<[u8]>>(&self, prefix: K, k: usize) -> Vec<(Vec<u8>, f64)> {
+        let prefix = prefix.as_ref();
+        if k == 0 {
+            return Vec::new();
+        }
+        let node = match self.find_node(prefix) {
+            Some(node) => node,
+            None => return Vec::new(),
+        };
+        let sketch = match &node.heavy {
+            Some(sketch) => sketch,
+            None => return Vec::new(),
+        };
+        let q = inclusion_prob(self.alpha, prefix.len());
+        let mut items: Vec<_> = sketch
+            .top_k(k)
+            .into_iter()
+            .map(|(suffix, weight)| {
+                let mut full = Vec::with_capacity(prefix.len() + suffix.len());
+                full.extend_from_slice(prefix);
+                full.extend_from_slice(&suffix);
+                (full, weight / q)
+            })
+            .collect();
+        items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        items
+    }
+
     /// Removes all non-root prefixes whose estimated absolute value is below `min_abs_estimate`.
-    /// Returns the number of nodes removed (including all descendants of removed prefixes).
+    /// Returns the number of nodes removed (including descendants).
     pub fn prune_by_estimate(&mut self, min_abs_estimate: f64) -> usize {
         if min_abs_estimate <= 0.0 {
             return 0;
@@ -175,10 +309,12 @@ impl GpsSketch {
     /// Merges `other` into `self` by pointwise addition.
     pub fn merge_from(&mut self, other: &GpsSketch) {
         assert!(
-            (self.alpha - other.alpha).abs() < 1e-12 && self.hash_seed == other.hash_seed,
-            "cannot merge sketches with mismatched alpha or hash seed"
+            (self.alpha - other.alpha).abs() < 1e-12
+                && self.hash_seed == other.hash_seed
+                && self.heavy_capacity == other.heavy_capacity,
+            "cannot merge sketches with mismatched alpha, hash seed, or HH capacity"
         );
-        merge_nodes(&mut self.root, &other.root);
+        merge_nodes(self.heavy_capacity, &mut self.root, &other.root);
     }
 
     fn find_node(&self, prefix: &[u8]) -> Option<&Node> {
@@ -196,7 +332,7 @@ impl GpsSketch {
         prefix: &mut Vec<u8>,
         out: &mut Vec<(Vec<u8>, f64)>,
     ) {
-        let estimate = node.sum / self.prefix_inclusion_prob(depth);
+        let estimate = node.sum / inclusion_prob(self.alpha, depth);
         out.push((prefix.clone(), estimate));
         for child in &node.children {
             prefix.push(child.byte);
@@ -212,10 +348,6 @@ impl GpsSketch {
         let hash = deterministic_hash(key, self.hash_seed);
         let level = self.sample_level_for_hash(hash);
         level.min(key.len())
-    }
-
-    fn prefix_inclusion_prob(&self, depth: usize) -> f64 {
-        inclusion_prob(self.alpha, depth)
     }
 
     fn sample_level_for_hash(&self, hash: u128) -> usize {
@@ -277,15 +409,33 @@ fn prune_node(alpha: f64, node: &mut Node, depth: usize, threshold: f64) -> usiz
     removed
 }
 
-fn merge_nodes(dst: &mut Node, src: &Node) {
+fn merge_nodes(capacity: Option<usize>, dst: &mut Node, src: &Node) {
     dst.sum += src.sum;
+    match (&mut dst.heavy, &src.heavy) {
+        (Some(dst_hh), Some(src_hh)) => {
+            for (suffix, weight) in src_hh.iter_entries() {
+                dst_hh.update(suffix, weight);
+            }
+        }
+        (None, Some(src_hh)) => {
+            if let Some(cap) = capacity {
+                let mut hh = SpaceSaving::new(cap);
+                for (suffix, weight) in src_hh.iter_entries() {
+                    hh.update(suffix, weight);
+                }
+                dst.heavy = Some(hh);
+            }
+        }
+        _ => {}
+    }
+
     for child in &src.children {
         if let Some(existing) = dst
             .children
             .iter_mut()
             .find(|candidate| candidate.byte == child.byte)
         {
-            merge_nodes(&mut existing.node, &child.node);
+            merge_nodes(capacity, &mut existing.node, &child.node);
         } else {
             dst.children.push(child.clone());
         }
@@ -419,7 +569,7 @@ mod tests {
         if prefix.is_empty() {
             return records.iter().map(|(_, delta)| *delta).sum();
         }
-        let q = sketch.prefix_inclusion_prob(depth);
+        let q = inclusion_prob(sketch.alpha(), depth);
         let mut acc = 0.0;
         for (key, delta) in records {
             if !key.starts_with(prefix) {
@@ -463,6 +613,54 @@ mod tests {
     }
 
     #[test]
+    fn heavy_hitters_track_top_suffixes() {
+        let mut sketch = GpsSketch::with_heavy_hitters(0.5, 0, 4);
+        for _ in 0..50 {
+            sketch.add("dog", 1.0);
+        }
+        for _ in 0..20 {
+            sketch.add("door", 1.0);
+        }
+        for _ in 0..10 {
+            sketch.add("doll", 1.0);
+        }
+
+        let tops = sketch.top_completions("d", 3);
+        assert_eq!(tops.len(), 3);
+        assert_eq!(tops[0].0, b"dog".to_vec());
+        assert!(tops[0].1 >= tops[1].1);
+    }
+
+    #[test]
+    fn heavy_hitters_scale_by_inclusion_prob() {
+        let mut sketch = GpsSketch::with_heavy_hitters(0.5, 0, 4);
+        let key = find_key_with_budget(&sketch, 3);
+        for _ in 0..50 {
+            sketch.add(&key, 1.0);
+        }
+
+        let prefix_len = 2.min(key.len());
+        let prefix = &key[..prefix_len];
+        let tops = sketch.top_completions(prefix, 1);
+        assert_eq!(&tops[0].0, &key);
+        let q = inclusion_prob(sketch.alpha(), prefix_len);
+        assert_close(tops[0].1, 50.0 / q, 1e-9);
+    }
+
+    fn find_key_with_budget(sketch: &GpsSketch, min_budget: usize) -> Vec<u8> {
+        for idx in 0..10_000 {
+            let candidate = format!("key-{idx}");
+            if sketch
+                .debug_prefix_budget(candidate.as_bytes())
+                .ge(&min_budget)
+            {
+                return candidate.into_bytes();
+            }
+        }
+        panic!("failed to find key with sufficient budget");
+    }
+
+    #[test]
     fn sampler_can_hit_very_deep_levels() {
         let sketch = GpsSketch::new(0.5);
         let level = sketch.debug_sample_level_from_bits(0);
@@ -476,6 +674,14 @@ mod tests {
         let mut b = GpsSketch::with_seed(0.5, 2);
         a.add("foo", 1.0);
         b.add("bar", 2.0);
+        a.merge_from(&b);
+    }
+
+    #[test]
+    #[should_panic(expected = "HH capacity")]
+    fn merge_requires_matching_hh_capacity() {
+        let mut a = GpsSketch::with_heavy_hitters(0.5, 0, 2);
+        let b = GpsSketch::with_seed(0.5, 0);
         a.merge_from(&b);
     }
 }
