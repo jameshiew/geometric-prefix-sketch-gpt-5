@@ -3,8 +3,11 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 
 fn main() {
     let mut rng = StdRng::seed_from_u64(7);
+    // Build a sketch that tracks up to 8 heavy completions per realized prefix.
     let mut sketch = GpsSketch::with_heavy_hitters(0.55, 123, 8);
 
+    // Feed random “query” strings into the sketch. Positive deltas contribute
+    // to the SpaceSaving summaries stored at each prefix.
     for _ in 0..10_000 {
         let key = random_word(&mut rng);
         sketch.add(key, 1.0);

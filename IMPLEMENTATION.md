@@ -88,7 +88,9 @@ workload.
 ### 6. Examples & documentation
 To make the crate usable without reading the entire design paper, we added:
 
-- `IMPLEMENTATION.md` (this doc) and `examples/basic.rs` / `examples/heavy_hitters.rs`.
+- `IMPLEMENTATION.md` (this doc) and `examples/basic.rs` / `examples/heavy_hitters.rs`
+  / `examples/merge_shards.rs` / `examples/range_counts.rs` to cover core use
+  cases (ingest + merge + heavy hitters + integer ranges).
 - Crate-level doc comment with runnable snippet.
 - Extensive rustdoc on each public method (detailing scaling, merges, etc.).
 
