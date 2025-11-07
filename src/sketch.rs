@@ -14,6 +14,12 @@ use crate::tree::{
 use crate::util::{HASH128_TO_UNIT, deterministic_hash, inclusion_prob};
 
 /// Geometric Prefix Sketch with deterministic per-key sampling.
+///
+/// `GpsSketch` stores a compressed prefix trie whose nodes are populated by a
+/// geometric (per-key) sampling scheme. Updates touch only a constant expected
+/// number of prefixes while estimates remain unbiased. Instances are
+/// merge-friendly as long as they share the same [`alpha`](Self::alpha) and
+/// [`hash_seed`](Self::hash_seed).
 #[derive(Clone, Debug)]
 pub struct GpsSketch {
     alpha: f64,
@@ -31,16 +37,26 @@ impl Default for GpsSketch {
 
 impl GpsSketch {
     /// Creates a new sketch with the provided geometric parameter `alpha`.
+    ///
+    /// `alpha` controls the per-depth inclusion probability (higher values
+    /// sample more prefixes per update but reduce variance on deep prefixes).
     pub fn new(alpha: f64) -> Self {
         Self::with_seed(alpha, 0)
     }
 
     /// Creates a sketch with explicit hash seed.
+    ///
+    /// Use this when multiple shards must produce identical sampling decisions
+    /// so their sketches can be merged later.
     pub fn with_seed(alpha: f64, hash_seed: u64) -> Self {
         Self::with_heavy_hitters_internal(alpha, hash_seed, None)
     }
 
     /// Creates a sketch with per-node heavy-hitter capacity.
+    ///
+    /// Heavy hitters are tracked via a SpaceSaving summary stored on each
+    /// visited prefix node. Only **positive** updates contribute to the heavy
+    /// hitter stream.
     pub fn with_heavy_hitters(alpha: f64, hash_seed: u64, hh_capacity: usize) -> Self {
         assert!(hh_capacity > 0);
         Self::with_heavy_hitters_internal(alpha, hash_seed, Some(hh_capacity))
@@ -63,11 +79,16 @@ impl GpsSketch {
     }
 
     /// Returns the configured `alpha`.
+    ///
+    /// `alpha` corresponds to the geometric inclusion probability `q(ℓ) =
+    /// alpha^(ℓ-1)` used when sampling prefixes.
     pub fn alpha(&self) -> f64 {
         self.alpha
     }
 
     /// Returns the deterministic hash seed.
+    ///
+    /// All sketches that need to merge must share this seed.
     pub fn hash_seed(&self) -> u64 {
         self.hash_seed
     }
@@ -78,6 +99,9 @@ impl GpsSketch {
     }
 
     /// Adds `delta` to `key`.
+    ///
+    /// Keys may be any byte slice (strings, paths, binary prefixes, …). Passing
+    /// a negative `delta` removes mass, which is useful for turnstile updates.
     pub fn add<K: AsRef<[u8]>>(&mut self, key: K, delta: f64) {
         if delta == 0.0 {
             return;
@@ -95,6 +119,9 @@ impl GpsSketch {
     }
 
     /// Returns the Horvitz–Thompson estimate of the sum under `prefix`.
+    ///
+    /// The estimator is unbiased for every prefix simultaneously. Nonexistent
+    /// prefixes return `0`.
     pub fn estimate<K: AsRef<[u8]>>(&self, prefix: K) -> f64 {
         match self.raw_sum(prefix.as_ref()) {
             Some((raw, depth)) => raw / inclusion_prob(self.alpha, depth),
@@ -102,7 +129,7 @@ impl GpsSketch {
         }
     }
 
-    /// Returns the global total estimate.
+    /// Returns the global total estimate (root prefix).
     pub fn total(&self) -> f64 {
         self.estimate(Vec::<u8>::new())
     }
@@ -112,17 +139,23 @@ impl GpsSketch {
         self.root = Node::new(self.heavy_capacity);
     }
 
-    /// Number of stored prefixes (materialized nodes + compressed interior ones).
+    /// Returns the number of stored prefixes (materialized nodes + compressed interior ones).
     pub fn node_count(&self) -> usize {
         self.root.count_prefixes()
     }
 
     /// Returns whether `prefix` currently exists in the trie.
+    ///
+    /// A prefix is considered present if it has ever been sampled and assigned a
+    /// node or mid-edge accumulator, regardless of its current estimated value.
     pub fn contains_prefix<K: AsRef<[u8]>>(&self, prefix: K) -> bool {
         self.raw_sum(prefix.as_ref()).is_some()
     }
 
     /// Returns iterator over all materialized prefixes and their estimates.
+    ///
+    /// Every prefix is cloned into an owned buffer so the iterator can outlive
+    /// the borrowed sketch.
     pub fn iter_estimates(&self) -> impl Iterator<Item = (Vec<u8>, f64)> {
         let mut out = Vec::new();
         let mut prefix = Vec::new();
@@ -131,6 +164,10 @@ impl GpsSketch {
     }
 
     /// Returns up to `k` heavy-hitter completions under `prefix`.
+    ///
+    /// Heavy hitters are available only when the sketch was created via
+    /// [`with_heavy_hitters`](Self::with_heavy_hitters). Results are sorted by
+    /// estimated weight.
     pub fn top_completions<K: AsRef<[u8]>>(&self, prefix: K, k: usize) -> Vec<(Vec<u8>, f64)> {
         if k == 0 {
             return Vec::new();
@@ -157,7 +194,10 @@ impl GpsSketch {
         items
     }
 
-    /// Removes entire subtrees whose root estimate is below the threshold.
+    /// Removes entire subtrees whose root estimate is below `min_abs_estimate`.
+    ///
+    /// This is useful for reclaiming memory from low-signal prefixes while
+    /// keeping the rest of the trie intact.
     pub fn prune_by_estimate(&mut self, min_abs_estimate: f64) -> usize {
         if min_abs_estimate <= 0.0 {
             return 0;
@@ -166,6 +206,10 @@ impl GpsSketch {
     }
 
     /// Merges `other` into `self` by streaming raw sums from its trie.
+    ///
+    /// Both sketches must share the same [`alpha`](Self::alpha),
+    /// [`hash_seed`](Self::hash_seed), and heavy-hitter capacity. The merge is
+    /// linear in the number of prefixes realized by `other`.
     pub fn merge_from(&mut self, other: &GpsSketch) {
         assert!((self.alpha - other.alpha).abs() < 1e-12);
         assert_eq!(self.hash_seed, other.hash_seed, "hash seed mismatch");
