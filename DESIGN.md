@@ -30,7 +30,7 @@ Consider keys as strings over an alphabet (bytes, UTF‑8 code units, bits for i
 Each realized trie node `P` stores:
 
 * `B_sum(P)`: a **rescaled** accumulator for the sum/count under prefix `P`.
-* (Optional) a tiny **heavy‑hitter sketch** (e.g., SpaceSaving or a 3–4 row Count‑Min) to extract frequent *extensions* under `P` for autocomplete.
+* (Optional) a tiny **heavy‑hitter sketch** (e.g., Misra-Gries or a 3–4 row Count‑Min) to extract frequent *extensions* under `P` for autocomplete.
 * Child pointers (we recommend a **compressed trie**/radix node to pack runs of characters).
 
 We fix a geometric parameter `α ∈ (0,1)` that tunes cost vs. accuracy (think `α = 1/2` by default).
@@ -132,7 +132,7 @@ struct Node {
   string edge_label;        // compressed run (could be slice into an arena)
   double B_sum;             // or fixed-point / 64-bit int if counts are big
   Children children;        // sorted small vector or array-mapped (HAMT-like)
-  Optional<HHSketch> hh;    // tiny SpaceSaving or CM-Sketch (optional)
+  Optional<HHSketch> hh;    // tiny Misra-Gries or CM-Sketch (optional)
 }
 ```
 
@@ -210,7 +210,7 @@ function estimate_prefix_sum(prefix, α=0.5):
 
    * Compressed radix trie + GPS logic.
    * Configurable `α`.
-   * Optional SpaceSaving sketch per node (capacity 8–16).
+   * Optional Misra-Gries sketch per node (capacity 8–16).
 2. **Datasets:**
 
    * Public query logs (e.g., AOL 2006), Wikipedia page titles, real URL paths, synthetic Zipfian strings.
@@ -242,7 +242,7 @@ function estimate_prefix_sum(prefix, α=0.5):
 * **Parameter choice.** Start with (\alpha=0.5). If you need higher fidelity at deeper levels (e.g., 3–5 chars), try 0.6–0.7; watch update cost ((1/(1-\alpha))).
 * **Integer ranges.** Implement a bit‑trie front end: a 64‑bit unsigned splits naturally into 64 levels; GPS updates only a constant expected number of levels; range queries decompose into (\le 2\log U) prefixes—sum their estimates.
 * **Bias/variance tuning.** You can make depth‑dependent (\alpha_\ell) (e.g., slower decay beyond depth 4) by reading more bits from the hash to sample from a *piecewise geometric* distribution; same analysis applies with (q(\ell)=\Pr[L\ge\ell]).
-* **Heavy hitters.** SpaceSaving with capacity 8–16 per node gives good top‑k completions; scale estimates by (1/q(|P|)).
+* **Heavy hitters.** Misra-Gries with capacity 8–16 per node gives good top‑k completions; scale estimates by (1/q(|P|)).
 * **Persistence.** Because decisions are hash‑deterministic, you can **replay** updates idempotently and snapshot/restore cheaply.
 * **Concurrency.** Shard by first byte/edge; merge node‑local counters with lock‑free atomics; the per‑node work is tiny.
 

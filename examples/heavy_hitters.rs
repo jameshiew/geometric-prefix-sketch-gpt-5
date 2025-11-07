@@ -7,7 +7,7 @@ fn main() {
     let mut sketch = GpsSketch::with_heavy_hitters(0.55, 123, 8);
 
     // Feed random “query” strings into the sketch. Positive deltas contribute
-    // to the SpaceSaving summaries stored at each prefix.
+    // to the Misra-Gries summaries stored at each prefix.
     for _ in 0..10_000 {
         let key = random_word(&mut rng);
         sketch.add(key, 1.0);

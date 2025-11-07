@@ -9,7 +9,7 @@ The crate exposes a single public type, [`GpsSketch`](src/sketch.rs), layered on
 three modules:
 
 - `util`: deterministic hashing (XXH3) and inclusion-probability helpers.
-- `tree`: compressed radix trie (nodes, edges, heavy-hitter SpaceSaving, merge
+- `tree`: compressed radix trie (nodes, edges, heavy-hitter Misra-Gries summaries, merge
   helpers). Most data-structure heavy lifting lives here.
 - `sketch`: user-facing API, sampling, deterministic merge wiring, and tests.
 
@@ -23,7 +23,7 @@ public API surface minimal.
 | Geometric depth sampling (Horvitz–Thompson rescaling) | ✅ Implemented. | `GpsSketch::add` samples a max depth using XXH3-derived uniform bits and `sample_level_for_hash`; queries rescale by `alpha^(depth-1)`.
 | Deterministic hashing | ✅ Implemented. | `util::deterministic_hash` uses `xxh3_128_with_seed` so shards merge safely.
 | Compressed radix trie with mid-edge mass | ✅ Implemented (see `tree.rs`). | Nodes hold `sum` plus edges with `label` and `mid_sums`. Node promotion depth currently hard-coded at 4 (`PROMOTION_DEPTH`).
-| Heavy-hitter sketches per node | ✅ Optional. | `SpaceSaving` stores top suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates.
+| Heavy-hitter sketches per node | ✅ Optional. | A Misra-Gries summary stores top suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates.
 | Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. HH sketches are merged entry-wise.
 | Pruning low-signal prefixes | ✅ `prune_by_estimate`. | Recurses through the trie, dropping subtrees once their scaled estimate falls below threshold.
 | Examples/benchmarks | ✅ `examples/` + Criterion benches. | Provide runnable demos and performance harnesses.
@@ -33,7 +33,7 @@ public API surface minimal.
 
 - **Configurable promotion depth:** currently a constant (`PROMOTION_DEPTH = 4`). DESIGN.md suggests adapting it; this is future work.
 - **Alternate alphabets / arenas:** the trie stores `Vec<u8>` for edge labels and allocates per insertion. Switching to arenas or slices would reduce fragmentation but adds complexity.
-- **Advanced heavy-hitter logic (e.g., Count-Min per node):** the current SpaceSaving is simple but sufficient for small `k`.
+- **Advanced heavy-hitter logic (e.g., Count-Min per node):** the current Misra-Gries summary is simple but sufficient for small `k`.
 - **Precision safeguards:** for very deep prefixes (depth > ~40) the inclusion probability underflows toward `f64::MIN_POSITIVE`. DESIGN.md hints at using arbitrary precision or per-depth scaling tables; presently we clamp to `MIN_POSITIVE`, which inflates variance but keeps numbers finite.
 
 ## Justifications / trade-offs
@@ -56,9 +56,9 @@ DESIGN.md left hashing “implementation-specific.” We chose XXH3 (128-bit) fo
 - Efficient pure-Rust implementation via `xxhash-rust`.
 - Seed control for shard merge compatibility.
 
-### 3. SpaceSaving index map
+### 3. Misra-Gries index map
 Original DESIGN only said “tiny heavy-hitter sketch”. Instead of a multi-row
-Count-Min, we use classic SpaceSaving with an auxiliary `HashMap` to keep
+Count-Min, we use a Misra-Gries summary with an auxiliary `HashMap` to keep
 updates `O(1)` despite storing arbitrary byte suffixes. This trades tiny extra
 memory (one hash entry per tracked suffix) for predictable speed.
 
@@ -90,6 +90,9 @@ added `tests/accuracy.rs`, which:
 - Adds targeted regression coverage (`merge_splits_compressed_edges_when_needed`)
   so merges stay correct even when long suffixes diverge past
   `PROMOTION_DEPTH`.
+- Validates heavy-hitter queries on compressed edges
+  (`heavy_hitters_cover_mid_edge_prefixes`) so autocomplete doesn’t break when a
+  prefix ends mid-edge.
 
 This ensures probabilistic behavior matches theory under a representative
 workload.
@@ -119,3 +122,18 @@ To make the crate usable without reading the entire design paper, we added:
 
 For now, this implementation matches the majority of DESIGN.md’s promises and
 keeps the public API ergonomic for application developers.
+
+### 7. Heavy hitters along compressed edges
+
+Users shouldn’t need to know whether a prefix stops at a node or mid-edge. The
+new `locate_prefix` helper lets `top_completions` stitch the remainder of a
+compressed edge onto the requested prefix before applying the Misra-Gries
+summary attached to the downstream node. Callers can now ask for completions of
+`"abcde"` even if the trie stores `"def"` as a single edge.
+
+### 8. Pointer safety in trie navigation
+
+Earlier versions relied on raw pointers in `ensure_unit_child` and
+`ensure_edge`. These helpers now work purely with safe Rust borrows by looking
+up indices first and re-borrowing after any structural edits. This removes the
+latent risk of invalidated pointers during merges or edge splits.

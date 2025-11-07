@@ -6,7 +6,7 @@ pub(crate) const PROMOTION_DEPTH: usize = 4;
 #[derive(Clone, Debug)]
 pub(crate) struct Node {
     pub(crate) sum: f64,
-    pub(crate) heavy: Option<SpaceSaving>,
+    pub(crate) heavy: Option<MisraGries>,
     pub(crate) children: Vec<Edge>,
 }
 
@@ -14,7 +14,7 @@ impl Node {
     pub(crate) fn new(heavy_capacity: Option<usize>) -> Self {
         Self {
             sum: 0.0,
-            heavy: heavy_capacity.map(SpaceSaving::new),
+            heavy: heavy_capacity.map(MisraGries::new),
             children: Vec::new(),
         }
     }
@@ -29,13 +29,11 @@ impl Node {
             .iter()
             .position(|edge| edge.label.len() == 1 && edge.label[0] == byte)
         {
-            let ptr: *mut Edge = &mut self.children[idx];
-            return unsafe { (*ptr).child.as_mut() };
+            return self.children[idx].child.as_mut();
         }
-        let mut edge = Edge::new(vec![byte], heavy_capacity);
-        let child_ptr: *mut Node = edge.child.as_mut();
-        self.children.push(edge);
-        unsafe { &mut *child_ptr }
+        self.children.push(Edge::new(vec![byte], heavy_capacity));
+        let len = self.children.len();
+        self.children[len - 1].child.as_mut()
     }
 
     pub(crate) fn update_heavy_hitters(&mut self, suffix: &[u8], delta: f64) {
@@ -107,7 +105,7 @@ impl Edge {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SpaceSaving {
+pub(crate) struct MisraGries {
     capacity: usize,
     entries: Vec<HeavyEntry>,
     index: HashMap<Vec<u8>, usize>,
@@ -119,7 +117,7 @@ struct HeavyEntry {
     weight: f64,
 }
 
-impl SpaceSaving {
+impl MisraGries {
     pub(crate) fn new(capacity: usize) -> Self {
         assert!(capacity > 0);
         Self {
@@ -137,30 +135,12 @@ impl SpaceSaving {
             self.entries[idx].weight += delta;
             return;
         }
-        if self.entries.len() < self.capacity {
-            let entry = HeavyEntry {
-                key: key.to_vec(),
-                weight: delta,
-            };
-            self.entries.push(entry);
-            self.index.insert(key.to_vec(), self.entries.len() - 1);
-            return;
-        }
-        let (min_idx, min_weight) = self
-            .entries
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.weight.partial_cmp(&b.weight).unwrap())
-            .map(|(idx, entry)| (idx, entry.weight))
-            .expect("entries non-empty");
-        let replacement = HeavyEntry {
+        self.entries.push(HeavyEntry {
             key: key.to_vec(),
-            weight: min_weight + delta,
-        };
-        let old = std::mem::replace(&mut self.entries[min_idx], replacement);
-        self.index.remove(&old.key);
-        self.index
-            .insert(self.entries[min_idx].key.clone(), min_idx);
+            weight: delta,
+        });
+        self.index.insert(key.to_vec(), self.entries.len() - 1);
+        self.trim_to_capacity();
     }
 
     pub(crate) fn top_k(&self, k: usize) -> Vec<(Vec<u8>, f64)> {
@@ -181,6 +161,39 @@ impl SpaceSaving {
         self.entries
             .iter()
             .map(|entry| (entry.key.as_slice(), entry.weight))
+    }
+
+    fn trim_to_capacity(&mut self) {
+        const EPS: f64 = 1e-12;
+        if self.entries.len() <= self.capacity {
+            return;
+        }
+        while self.entries.len() > self.capacity {
+            let min_weight = self
+                .entries
+                .iter()
+                .fold(f64::INFINITY, |acc, entry| acc.min(entry.weight));
+            if !min_weight.is_finite() {
+                break;
+            }
+            if min_weight <= 0.0 {
+                self.entries.retain(|entry| entry.weight > EPS);
+            } else {
+                for entry in self.entries.iter_mut() {
+                    entry.weight -= min_weight;
+                }
+                self.entries.retain(|entry| entry.weight > EPS);
+            }
+        }
+        self.rebuild_index();
+    }
+
+    fn rebuild_index(&mut self) {
+        self.index.clear();
+        self.index.reserve(self.entries.len());
+        for (idx, entry) in self.entries.iter().enumerate() {
+            self.index.insert(entry.key.clone(), idx);
+        }
     }
 }
 
@@ -208,11 +221,16 @@ pub(crate) fn add_inner(
     let mut offset = depth;
     while offset < limit {
         let remaining = &key[offset..];
-        let edge = ensure_edge(current, remaining, heavy_capacity);
-        let consume = (limit - offset).min(edge.label.len());
-        edge.add_weight(consume, delta);
+        let edge_idx = ensure_edge(current, remaining, heavy_capacity);
+        let edge_len = current.children[edge_idx].label.len();
+        let consume = (limit - offset).min(edge_len);
+        {
+            let edge = &mut current.children[edge_idx];
+            edge.add_weight(consume, delta);
+        }
         offset += consume;
-        if consume == edge.label.len() {
+        if consume == edge_len {
+            let edge = &mut current.children[edge_idx];
             let child = edge.child.as_mut();
             child.sum += delta;
             child.update_heavy_hitters(&key[offset..], delta);
@@ -246,13 +264,25 @@ pub(crate) fn locate_raw_sum(node: &Node, prefix: &[u8], depth: usize) -> Option
     None
 }
 
-pub(crate) fn locate_node<'a>(
+pub(crate) enum PrefixMatch<'a> {
+    Node {
+        node: &'a Node,
+        depth: usize,
+    },
+    MidEdge {
+        child: &'a Node,
+        remaining_label: &'a [u8],
+        depth: usize,
+    },
+}
+
+pub(crate) fn locate_prefix<'a>(
     node: &'a Node,
     prefix: &[u8],
     depth: usize,
-) -> Option<(&'a Node, usize)> {
+) -> Option<PrefixMatch<'a>> {
     if prefix.is_empty() {
-        return Some((node, depth));
+        return Some(PrefixMatch::Node { node, depth });
     }
     for edge in &node.children {
         if edge.label[0] != prefix[0] {
@@ -261,12 +291,19 @@ pub(crate) fn locate_node<'a>(
         let lcp = common_prefix_len(&edge.label, prefix);
         if lcp == prefix.len() {
             if lcp == edge.label.len() {
-                return Some((&edge.child, depth + lcp));
+                return Some(PrefixMatch::Node {
+                    node: &edge.child,
+                    depth: depth + lcp,
+                });
             }
-            return None;
+            return Some(PrefixMatch::MidEdge {
+                child: &edge.child,
+                remaining_label: &edge.label[lcp..],
+                depth: depth + lcp,
+            });
         }
         if lcp == edge.label.len() {
-            return locate_node(&edge.child, &prefix[lcp..], depth + lcp);
+            return locate_prefix(&edge.child, &prefix[lcp..], depth + lcp);
         }
         return None;
     }
@@ -326,7 +363,7 @@ pub(crate) fn merge_nodes(dst: &mut Node, src: &Node, heavy_capacity: Option<usi
         }
         (None, Some(src_hh)) => {
             if let Some(cap) = heavy_capacity {
-                let mut hh = SpaceSaving::new(cap);
+                let mut hh = MisraGries::new(cap);
                 for (suffix, weight) in src_hh.iter_entries() {
                     hh.update(suffix, weight);
                 }
@@ -411,36 +448,42 @@ fn merge_edge_segment(
     });
 }
 
-pub(crate) fn ensure_edge<'a>(
-    node: &'a mut Node,
+pub(crate) fn ensure_edge(
+    node: &mut Node,
     remaining: &[u8],
     heavy_capacity: Option<usize>,
-) -> &'a mut Edge {
+) -> usize {
     loop {
-        if let Some(idx) = node
-            .children
-            .iter()
-            .position(|edge| edge.label[0] == remaining[0])
-        {
-            let edge_ptr: *mut Edge = &mut node.children[idx];
-            let edge = unsafe { &mut *edge_ptr };
-            let lcp = common_prefix_len(&edge.label, remaining);
-            if lcp == 0 {
-                node.children
-                    .push(Edge::new(remaining.to_vec(), heavy_capacity));
-                let len = node.children.len();
-                return &mut node.children[len - 1];
+        let match_idx = {
+            let mut idx = None;
+            for i in 0..node.children.len() {
+                if node.children[i].label[0] == remaining[0] {
+                    idx = Some(i);
+                    break;
+                }
             }
-            if lcp < edge.label.len() && lcp < remaining.len() {
-                edge.split(lcp, heavy_capacity);
+            idx
+        };
+        if let Some(idx) = match_idx {
+            let split_again = {
+                let edge = &mut node.children[idx];
+                let lcp = common_prefix_len(&edge.label, remaining);
+                debug_assert!(lcp > 0);
+                if lcp < edge.label.len() && lcp < remaining.len() {
+                    edge.split(lcp, heavy_capacity);
+                    true
+                } else {
+                    return idx;
+                }
+            };
+            if split_again {
                 continue;
             }
-            return edge;
+        } else {
+            node.children
+                .push(Edge::new(remaining.to_vec(), heavy_capacity));
+            return node.children.len() - 1;
         }
-        node.children
-            .push(Edge::new(remaining.to_vec(), heavy_capacity));
-        let idx = node.children.len() - 1;
-        return &mut node.children[idx];
     }
 }
 
