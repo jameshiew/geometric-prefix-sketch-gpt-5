@@ -143,7 +143,7 @@ struct Node {
 
 ```c
 uint64_t h = splitmix64(key_bytes);
-int L = 1 + clz( (~h) & (h-1) );  // equivalent to number of leading zeros before first 1
+int L = 1 + clz(h);   // number of leading zeros until the first 1 bit
 L = min(L, key_length);
 ```
 
