@@ -4,15 +4,58 @@
 //! unbiased prefix aggregates while touching only a geometrically sampled
 //! portion of each key's prefixes, so updates take constant expected time.
 
-use std::collections::HashMap;
-
 use xxhash_rust::xxh3::xxh3_128_with_seed;
 
 const HASH128_TO_UNIT: f64 = 1.0 / ((u128::MAX as f64) + 1.0);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct Node {
     sum: f64,
+    children: Vec<Child>,
+}
+
+#[derive(Clone, Debug)]
+struct Child {
+    byte: u8,
+    node: Box<Node>,
+}
+
+impl Default for Node {
+    fn default() -> Self {
+        Self {
+            sum: 0.0,
+            children: Vec::new(),
+        }
+    }
+}
+
+impl Node {
+    fn ensure_child(&mut self, byte: u8) -> &mut Node {
+        if let Some(pos) = self.children.iter().position(|child| child.byte == byte) {
+            return &mut self.children[pos].node;
+        }
+        self.children.push(Child {
+            byte,
+            node: Box::new(Node::default()),
+        });
+        let idx = self.children.len() - 1;
+        &mut self.children[idx].node
+    }
+
+    fn get_child(&self, byte: u8) -> Option<&Node> {
+        self.children
+            .iter()
+            .find(|child| child.byte == byte)
+            .map(|child| child.node.as_ref())
+    }
+
+    fn node_count(&self) -> usize {
+        1 + self
+            .children
+            .iter()
+            .map(|child| child.node.node_count())
+            .sum::<usize>()
+    }
 }
 
 /// Geometric Prefix Sketch with deterministic per-key sampling.
@@ -21,7 +64,7 @@ pub struct GpsSketch {
     alpha: f64,
     log_alpha: f64,
     hash_seed: u64,
-    nodes: HashMap<Vec<u8>, Node>,
+    root: Node,
 }
 
 impl Default for GpsSketch {
@@ -43,13 +86,11 @@ impl GpsSketch {
     pub fn with_seed(alpha: f64, hash_seed: u64) -> Self {
         assert!(alpha.is_finite());
         assert!(alpha > 0.0 && alpha < 1.0, "alpha must be in (0, 1)");
-        let mut nodes = HashMap::new();
-        nodes.insert(Vec::new(), Node::default());
         Self {
             alpha,
             log_alpha: alpha.ln(),
             hash_seed,
-            nodes,
+            root: Node::default(),
         }
     }
 
@@ -71,26 +112,13 @@ impl GpsSketch {
 
         let key = key.as_ref();
         let limit = self.prefix_budget(key);
-        self.root_mut().sum += delta;
+        self.root.sum += delta;
 
-        if limit == 0 {
-            return;
-        }
-
-        let mut prefix = Vec::with_capacity(limit);
-        for (depth, &byte) in key.iter().enumerate() {
-            prefix.push(byte);
-            let prefix_depth = depth + 1;
-            if prefix_depth > limit {
-                break;
-            }
-
-            let node = self.nodes.entry(prefix.clone()).or_default();
+        let mut node = &mut self.root;
+        for depth in 0..limit {
+            let byte = key[depth];
+            node = node.ensure_child(byte);
             node.sum += delta;
-
-            if prefix_depth == limit {
-                break;
-            }
         }
     }
 
@@ -98,7 +126,7 @@ impl GpsSketch {
     pub fn estimate<K: AsRef<[u8]>>(&self, prefix: K) -> f64 {
         let prefix = prefix.as_ref();
         let depth = prefix.len();
-        match self.nodes.get(prefix) {
+        match self.find_node(prefix) {
             Some(node) => {
                 let q = self.prefix_inclusion_prob(depth);
                 node.sum / q
@@ -114,49 +142,34 @@ impl GpsSketch {
 
     /// Removes all data from the sketch.
     pub fn clear(&mut self) {
-        self.nodes.clear();
-        self.nodes.insert(Vec::new(), Node::default());
+        self.root = Node::default();
     }
 
     /// Number of materialized prefixes (including root).
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.root.node_count()
     }
 
     /// Returns whether `prefix` currently has a node in the trie.
     pub fn contains_prefix<K: AsRef<[u8]>>(&self, prefix: K) -> bool {
-        self.nodes.contains_key(prefix.as_ref())
+        self.find_node(prefix.as_ref()).is_some()
     }
 
     /// Returns an iterator over all materialized prefixes along with their estimates.
-    pub fn iter_estimates(&self) -> impl Iterator<Item = (&[u8], f64)> + '_ {
-        self.nodes.iter().map(move |(prefix, node)| {
-            let estimate = node.sum / self.prefix_inclusion_prob(prefix.len());
-            (prefix.as_slice(), estimate)
-        })
+    pub fn iter_estimates(&self) -> impl Iterator<Item = (Vec<u8>, f64)> {
+        let mut all = Vec::new();
+        let mut prefix = Vec::new();
+        self.collect_estimates(&self.root, 0, &mut prefix, &mut all);
+        all.into_iter()
     }
 
     /// Removes all non-root prefixes whose estimated absolute value is below `min_abs_estimate`.
-    /// Returns the number of nodes removed.
+    /// Returns the number of nodes removed (including all descendants of removed prefixes).
     pub fn prune_by_estimate(&mut self, min_abs_estimate: f64) -> usize {
         if min_abs_estimate <= 0.0 {
             return 0;
         }
-        let mut to_remove = Vec::new();
-        for (prefix, node) in &self.nodes {
-            if prefix.is_empty() {
-                continue;
-            }
-            let estimate = node.sum / self.prefix_inclusion_prob(prefix.len());
-            if estimate.abs() < min_abs_estimate {
-                to_remove.push(prefix.clone());
-            }
-        }
-        let removed = to_remove.len();
-        for prefix in to_remove {
-            self.nodes.remove(&prefix);
-        }
-        removed
+        prune_node(self.alpha, &mut self.root, 0, min_abs_estimate)
     }
 
     /// Merges `other` into `self` by pointwise addition.
@@ -165,14 +178,31 @@ impl GpsSketch {
             (self.alpha - other.alpha).abs() < 1e-12 && self.hash_seed == other.hash_seed,
             "cannot merge sketches with mismatched alpha or hash seed"
         );
-        for (prefix, node) in &other.nodes {
-            let entry = self.nodes.entry(prefix.clone()).or_default();
-            entry.sum += node.sum;
-        }
+        merge_nodes(&mut self.root, &other.root);
     }
 
-    fn root_mut(&mut self) -> &mut Node {
-        self.nodes.entry(Vec::new()).or_default()
+    fn find_node(&self, prefix: &[u8]) -> Option<&Node> {
+        let mut node = &self.root;
+        for &byte in prefix {
+            node = node.get_child(byte)?;
+        }
+        Some(node)
+    }
+
+    fn collect_estimates(
+        &self,
+        node: &Node,
+        depth: usize,
+        prefix: &mut Vec<u8>,
+        out: &mut Vec<(Vec<u8>, f64)>,
+    ) {
+        let estimate = node.sum / self.prefix_inclusion_prob(depth);
+        out.push((prefix.clone(), estimate));
+        for child in &node.children {
+            prefix.push(child.byte);
+            self.collect_estimates(&child.node, depth + 1, prefix, out);
+            prefix.pop();
+        }
     }
 
     fn prefix_budget(&self, key: &[u8]) -> usize {
@@ -185,15 +215,7 @@ impl GpsSketch {
     }
 
     fn prefix_inclusion_prob(&self, depth: usize) -> f64 {
-        if depth <= 1 {
-            return 1.0;
-        }
-        let value = self.alpha.powf((depth - 1) as f64);
-        if value < f64::MIN_POSITIVE {
-            f64::MIN_POSITIVE
-        } else {
-            value
-        }
+        inclusion_prob(self.alpha, depth)
     }
 
     fn sample_level_for_hash(&self, hash: u128) -> usize {
@@ -208,7 +230,7 @@ impl GpsSketch {
 
     #[cfg(test)]
     fn raw_node_sum(&self, prefix: &[u8]) -> Option<f64> {
-        self.nodes.get(prefix).map(|node| node.sum)
+        self.find_node(prefix).map(|node| node.sum)
     }
 
     #[cfg(test)]
@@ -224,6 +246,50 @@ impl GpsSketch {
 
 fn deterministic_hash(bytes: &[u8], seed: u64) -> u128 {
     xxh3_128_with_seed(bytes, seed)
+}
+
+fn inclusion_prob(alpha: f64, depth: usize) -> f64 {
+    if depth <= 1 {
+        return 1.0;
+    }
+    let value = alpha.powf((depth - 1) as f64);
+    if value < f64::MIN_POSITIVE {
+        f64::MIN_POSITIVE
+    } else {
+        value
+    }
+}
+
+fn prune_node(alpha: f64, node: &mut Node, depth: usize, threshold: f64) -> usize {
+    let mut removed = 0;
+    let mut idx = 0;
+    while idx < node.children.len() {
+        let child_depth = depth + 1;
+        let estimate = node.children[idx].node.sum / inclusion_prob(alpha, child_depth);
+        if estimate.abs() < threshold {
+            removed += node.children[idx].node.node_count();
+            node.children.remove(idx);
+        } else {
+            removed += prune_node(alpha, &mut node.children[idx].node, child_depth, threshold);
+            idx += 1;
+        }
+    }
+    removed
+}
+
+fn merge_nodes(dst: &mut Node, src: &Node) {
+    dst.sum += src.sum;
+    for child in &src.children {
+        if let Some(existing) = dst
+            .children
+            .iter_mut()
+            .find(|candidate| candidate.byte == child.byte)
+        {
+            merge_nodes(&mut existing.node, &child.node);
+        } else {
+            dst.children.push(child.clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -388,7 +454,8 @@ mod tests {
 
         let mut seen = HashMap::new();
         for (prefix, estimate) in sketch.iter_estimates() {
-            seen.insert(String::from_utf8(prefix.to_vec()).unwrap(), estimate);
+            let key = String::from_utf8(prefix).unwrap();
+            seen.insert(key, estimate);
         }
 
         assert_close(*seen.get("d").unwrap(), 5.0, 1e-9);
