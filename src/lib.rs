@@ -7,8 +7,6 @@
 //! past a configurable promotion depth occupy a single node/edge instead of one
 //! heap allocation per byte.
 
-use std::collections::HashMap;
-
 use xxhash_rust::xxh3::xxh3_128_with_seed;
 
 const HASH128_TO_UNIT: f64 = 1.0 / ((u128::MAX as f64) + 1.0);
@@ -175,6 +173,12 @@ impl SpaceSaving {
         items.truncate(items.len().min(k));
         items
     }
+
+    fn iter_entries(&self) -> impl Iterator<Item = (&[u8], f64)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.key.as_slice(), entry.weight))
+    }
 }
 
 /// Geometric Prefix Sketch with deterministic per-key sampling.
@@ -329,7 +333,7 @@ impl GpsSketch {
         prune_node(self.alpha, &mut self.root, 0, min_abs_estimate)
     }
 
-    /// Merges `other` into `self` by rebuilding from combined raw sums.
+    /// Merges `other` into `self` by streaming raw sums from its trie.
     pub fn merge_from(&mut self, other: &GpsSketch) {
         assert!((self.alpha - other.alpha).abs() < 1e-12);
         assert_eq!(self.hash_seed, other.hash_seed, "hash seed mismatch");
@@ -338,34 +342,20 @@ impl GpsSketch {
             "HH capacity mismatch"
         );
 
-        let mut totals: HashMap<Vec<u8>, f64> = HashMap::new();
-        self.collect_raw_into(&mut totals);
-        other.collect_raw_into(&mut totals);
+        let mut prefix = Vec::new();
+        other.visit_raw(&mut prefix, &mut |pref, sum| {
+            self.add_raw_sum(pref, sum);
+        });
 
-        let mut heavy: HashMap<Vec<u8>, Vec<(Vec<u8>, f64)>> = HashMap::new();
-        self.collect_heavy_into(&mut heavy);
-        other.collect_heavy_into(&mut heavy);
-
-        self.clear();
-        for (prefix, sum) in totals {
-            self.add_raw_sum(&prefix, sum);
-        }
-        let hh_cap = self.heavy_capacity;
-        for (prefix, entries) in heavy {
-            if entries.is_empty() {
-                continue;
-            }
-            if let Some(node) = self.ensure_node(prefix.as_slice()) {
-                if hh_cap.is_none() {
-                    continue;
+        if let Some(cap) = self.heavy_capacity {
+            other.visit_heavy(&mut prefix, &mut |pref, sketch| {
+                if let Some(node) = self.ensure_node(pref) {
+                    let hh = node.heavy.get_or_insert_with(|| SpaceSaving::new(cap));
+                    for (suffix, weight) in sketch.iter_entries() {
+                        hh.update(suffix, weight);
+                    }
                 }
-                let hh = node
-                    .heavy
-                    .get_or_insert_with(|| SpaceSaving::new(hh_cap.unwrap()));
-                for (suffix, weight) in entries {
-                    hh.update(&suffix, weight);
-                }
-            }
+            });
         }
     }
 
@@ -442,14 +432,18 @@ impl GpsSketch {
         }
     }
 
-    fn collect_raw_into(&self, out: &mut HashMap<Vec<u8>, f64>) {
-        let mut prefix = Vec::new();
-        collect_raw(&self.root, 0, &mut prefix, out);
+    fn visit_raw<F>(&self, prefix: &mut Vec<u8>, f: &mut F)
+    where
+        F: FnMut(&[u8], f64),
+    {
+        visit_raw(&self.root, prefix, f);
     }
 
-    fn collect_heavy_into(&self, out: &mut HashMap<Vec<u8>, Vec<(Vec<u8>, f64)>>) {
-        let mut prefix = Vec::new();
-        collect_heavy(&self.root, &mut prefix, out);
+    fn visit_heavy<F>(&self, prefix: &mut Vec<u8>, f: &mut F)
+    where
+        F: FnMut(&[u8], &SpaceSaving),
+    {
+        visit_heavy(&self.root, prefix, f);
     }
 }
 
@@ -644,41 +638,37 @@ fn add_inner(
     }
 }
 
-fn collect_raw(node: &Node, depth: usize, prefix: &mut Vec<u8>, out: &mut HashMap<Vec<u8>, f64>) {
-    out.entry(prefix.clone())
-        .and_modify(|v| *v += node.sum)
-        .or_insert(node.sum);
+fn visit_raw<F>(node: &Node, prefix: &mut Vec<u8>, f: &mut F)
+where
+    F: FnMut(&[u8], f64),
+{
+    f(prefix, node.sum);
     for edge in &node.children {
         for (i, &byte) in edge.label.iter().enumerate() {
             prefix.push(byte);
             if i + 1 == edge.label.len() {
-                collect_raw(&edge.child, depth + i + 1, prefix, out);
+                visit_raw(&edge.child, prefix, f);
             } else {
                 let raw = edge.mid_sums[i];
-                out.entry(prefix.clone())
-                    .and_modify(|v| *v += raw)
-                    .or_insert(raw);
+                f(prefix, raw);
             }
             prefix.pop();
         }
     }
 }
 
-fn collect_heavy(
-    node: &Node,
-    prefix: &mut Vec<u8>,
-    out: &mut HashMap<Vec<u8>, Vec<(Vec<u8>, f64)>>,
-) {
+fn visit_heavy<F>(node: &Node, prefix: &mut Vec<u8>, f: &mut F)
+where
+    F: FnMut(&[u8], &SpaceSaving),
+{
     if let Some(sketch) = &node.heavy {
-        out.entry(prefix.clone())
-            .or_default()
-            .extend(sketch.top_k(sketch.capacity));
+        f(prefix, sketch);
     }
     for edge in &node.children {
         for &byte in &edge.label {
             prefix.push(byte);
         }
-        collect_heavy(&edge.child, prefix, out);
+        visit_heavy(&edge.child, prefix, f);
         for _ in &edge.label {
             prefix.pop();
         }
