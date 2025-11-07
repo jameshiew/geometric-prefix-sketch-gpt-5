@@ -56,6 +56,11 @@ DESIGN.md left hashing “implementation-specific.” We chose XXH3 (128-bit) fo
 - Efficient pure-Rust implementation via `xxhash-rust`.
 - Seed control for shard merge compatibility.
 
+When building shards independently, every sketch that will eventually merge
+must share both `alpha` and the `hash_seed`. Pick a non-guessable seed whenever
+adversarial keys might try to predict sampling depths; `GpsSketch::with_seed`
+is the intended entry point for that configuration.
+
 Sampling now mirrors the design’s deterministic story exactly:
 
 - For `α = 0.5` (the default), `sample_level_for_hash` uses just the

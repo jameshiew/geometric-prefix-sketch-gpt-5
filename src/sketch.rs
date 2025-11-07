@@ -7,11 +7,11 @@
 //! past a configurable promotion depth occupy a single node/edge instead of one
 //! heap allocation per byte.
 
+#[cfg(test)]
+use crate::tree::{MisraGries, PROMOTION_DEPTH, ensure_edge, visit_raw};
 use crate::tree::{
     Node, PrefixMatch, add_inner, locate_prefix, locate_raw_sum, merge_nodes, prune_node,
 };
-#[cfg(test)]
-use crate::tree::{PROMOTION_DEPTH, ensure_edge, visit_raw};
 use crate::util::{deterministic_hash, inclusion_prob, probability_to_hash_threshold};
 
 /// Geometric Prefix Sketch with deterministic per-key sampling.
@@ -47,7 +47,8 @@ impl GpsSketch {
     /// Creates a sketch with explicit hash seed.
     ///
     /// Use this when multiple shards must produce identical sampling decisions
-    /// so their sketches can be merged later.
+    /// so their sketches can be merged later. For adversarial workloads, pick a
+    /// non-guessable seed so attackers cannot predict sampling depths.
     pub fn with_seed(alpha: f64, hash_seed: u64) -> Self {
         Self::with_heavy_hitters_internal(alpha, hash_seed, None)
     }
@@ -87,7 +88,8 @@ impl GpsSketch {
 
     /// Returns the deterministic hash seed.
     ///
-    /// All sketches that need to merge must share this seed.
+    /// All sketches that need to merge must share this seed (and the same
+    /// `alpha`).
     pub fn hash_seed(&self) -> u64 {
         self.hash_seed
     }
@@ -123,7 +125,10 @@ impl GpsSketch {
     /// prefixes return `0`.
     pub fn estimate<K: AsRef<[u8]>>(&self, prefix: K) -> f64 {
         match self.raw_sum(prefix.as_ref()) {
-            Some((raw, depth)) => raw / inclusion_prob(self.alpha, depth),
+            Some((raw, depth)) => {
+                let q = inclusion_prob(self.alpha, depth);
+                if q == 0.0 { 0.0 } else { raw / q }
+            }
             None => 0.0,
         }
     }
@@ -168,7 +173,10 @@ impl GpsSketch {
     /// [`with_heavy_hitters`](Self::with_heavy_hitters). Results are sorted by
     /// estimated weight. Prefixes that end mid-edge in the compressed trie are
     /// automatically completed through that edge before heavy-hitter suffixes
-    /// are appended.
+    /// are appended. Updates that sampled only up to the mid-edge (without a
+    /// suffix) never enter the downstream node’s summary, so they’re omitted
+    /// from the heavy-hitter output unless per-position HH sketches are
+    /// enabled.
     pub fn top_completions<K: AsRef<[u8]>>(&self, prefix: K, k: usize) -> Vec<(Vec<u8>, f64)> {
         if k == 0 {
             return Vec::new();
@@ -179,13 +187,31 @@ impl GpsSketch {
         };
         match hit {
             PrefixMatch::Node { node, depth } => {
-                self.completions_from_summary(prefix, &[], node, depth, k)
+                let direct = self.completions_from_summary(prefix, &[], node, depth, k);
+                if !direct.is_empty() {
+                    return direct;
+                }
+                let missing_summary = node.heavy.as_ref().map_or(true, |hh| hh.is_empty());
+                if missing_summary && node.children.len() == 1 {
+                    let edge = &node.children[0];
+                    return self.completions_from_summary(
+                        prefix,
+                        &edge.label,
+                        &edge.child,
+                        depth + edge.label.len(),
+                        k,
+                    );
+                }
+                direct
             }
             PrefixMatch::MidEdge {
                 child,
                 remaining_label,
                 depth,
-            } => self.completions_from_summary(prefix, remaining_label, child, depth, k),
+            } => {
+                let scale_depth = depth + remaining_label.len();
+                self.completions_from_summary(prefix, remaining_label, child, scale_depth, k)
+            }
         }
     }
 
@@ -224,13 +250,14 @@ impl GpsSketch {
         base_prefix: &[u8],
         forced_suffix: &[u8],
         node: &Node,
-        depth: usize,
+        scale_depth: usize,
         k: usize,
     ) -> Vec<(Vec<u8>, f64)> {
         let Some(sketch) = &node.heavy else {
             return Vec::new();
         };
-        let q = inclusion_prob(self.alpha, depth);
+        let q = inclusion_prob(self.alpha, scale_depth);
+        let scale = if q == 0.0 { 0.0 } else { 1.0 / q };
         let mut items: Vec<_> = sketch
             .top_k(k)
             .into_iter()
@@ -240,7 +267,8 @@ impl GpsSketch {
                 full.extend_from_slice(base_prefix);
                 full.extend_from_slice(forced_suffix);
                 full.extend_from_slice(&suffix);
-                (full, weight / q)
+                let est = if scale == 0.0 { 0.0 } else { weight * scale };
+                (full, est)
             })
             .collect();
         items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -254,7 +282,8 @@ impl GpsSketch {
         prefix: &mut Vec<u8>,
         out: &mut Vec<(Vec<u8>, f64)>,
     ) {
-        let estimate = node.sum / inclusion_prob(self.alpha, depth);
+        let q = inclusion_prob(self.alpha, depth);
+        let estimate = if q == 0.0 { 0.0 } else { node.sum / q };
         out.push((prefix.clone(), estimate));
         for edge in &node.children {
             for (i, &byte) in edge.label.iter().enumerate() {
@@ -264,7 +293,8 @@ impl GpsSketch {
                     self.collect_estimates(&edge.child, new_depth, prefix, out);
                 } else {
                     let raw = edge.mid_sums[i];
-                    let est = raw / inclusion_prob(self.alpha, new_depth);
+                    let q_mid = inclusion_prob(self.alpha, new_depth);
+                    let est = if q_mid == 0.0 { 0.0 } else { raw / q_mid };
                     out.push((prefix.clone(), est));
                 }
                 prefix.pop();
@@ -379,6 +409,7 @@ impl GpsSketch {
 mod tests {
     use super::*;
     use rand::prelude::*;
+    use rand::rngs::StdRng;
     use std::collections::HashMap;
 
     fn force_full_depth_insert(sketch: &mut GpsSketch, key: &[u8], delta: f64) {
@@ -401,6 +432,28 @@ mod tests {
         assert!((a - b).abs() <= tol, "{a} vs {b} (tol {tol})");
     }
 
+    fn zero_out_tree(node: &mut Node, heavy_capacity: Option<usize>) {
+        node.sum = 0.0;
+        node.heavy = heavy_capacity.map(MisraGries::new);
+        for edge in &mut node.children {
+            for raw in &mut edge.mid_sums {
+                *raw = 0.0;
+            }
+            zero_out_tree(edge.child.as_mut(), heavy_capacity);
+        }
+    }
+
+    fn sort_completions(entries: &mut Vec<(Vec<u8>, f64)>) {
+        entries.sort_by(|a, b| {
+            let key_cmp = a.0.cmp(&b.0);
+            if key_cmp == std::cmp::Ordering::Equal {
+                a.1.partial_cmp(&b.1).unwrap()
+            } else {
+                key_cmp
+            }
+        });
+    }
+
     #[test]
     fn depth_one_counts_are_exact() {
         let mut sketch = GpsSketch::default();
@@ -413,9 +466,9 @@ mod tests {
 
     #[test]
     fn merge_matches_single_pass() {
-        let mut left = GpsSketch::default();
-        let mut right = GpsSketch::default();
-        let mut combined = GpsSketch::default();
+        let mut left = GpsSketch::with_seed(0.5, 42);
+        let mut right = GpsSketch::with_seed(0.5, 42);
+        let mut combined = GpsSketch::with_seed(0.5, 42);
         let keys = [
             "alpha", "alpine", "beta", "betamax", "gamma", "garden", "alphabet",
         ];
@@ -436,9 +489,9 @@ mod tests {
 
     #[test]
     fn merge_splits_compressed_edges_when_needed() {
-        let mut left = GpsSketch::default();
-        let mut right = GpsSketch::default();
-        let mut combined = GpsSketch::default();
+        let mut left = GpsSketch::with_seed(0.5, 7);
+        let mut right = GpsSketch::with_seed(0.5, 7);
+        let mut combined = GpsSketch::with_seed(0.5, 7);
 
         force_full_depth_insert(&mut left, b"abcdefg", 1.0);
         force_full_depth_insert(&mut right, b"abcdexy", 1.0);
@@ -500,7 +553,11 @@ mod tests {
             assert_close(actual, expected, 1e-9);
             let est = sketch.estimate(prefix);
             let q = inclusion_prob(sketch.alpha(), prefix.len());
-            assert_close(est, expected / q, 1e-6);
+            if q == 0.0 {
+                assert_close(est, 0.0, 1e-9);
+            } else {
+                assert_close(est, expected / q, 1e-6);
+            }
         }
     }
 
@@ -573,7 +630,8 @@ mod tests {
         let mut prefix = Vec::new();
         sketch.visit_raw(&mut prefix, &mut |pref, raw| {
             let depth = pref.len();
-            let est = raw / inclusion_prob(sketch.alpha(), depth);
+            let q = inclusion_prob(sketch.alpha(), depth);
+            let est = if q == 0.0 { 0.0 } else { raw / q };
             visit_map.insert(pref.to_vec(), est);
         });
 
@@ -668,6 +726,43 @@ mod tests {
         let keys: Vec<_> = tops.into_iter().map(|(k, _)| k).collect();
         assert!(keys.contains(&b"abcdefg"[..].to_vec()));
         assert!(keys.contains(&b"abcdefgh"[..].to_vec()));
+    }
+
+    #[test]
+    fn mid_edge_top_completions_use_child_depth() {
+        let mut sketch = GpsSketch::with_heavy_hitters(0.5, 11, 8);
+        force_full_depth_insert(&mut sketch, b"abcdefgh", 8.0);
+        let tops = sketch.top_completions("abcde", 1);
+        assert_eq!(tops.len(), 1);
+        assert_eq!(tops[0].0, b"abcdefgh".to_vec());
+        let point_estimate = sketch.estimate("abcdefgh");
+        assert_close(tops[0].1, point_estimate, 1e-9);
+    }
+
+    #[test]
+    fn top_completions_survive_structural_split() {
+        let seed = 13;
+        let hh_cap = 8;
+        let mut sketch = GpsSketch::with_heavy_hitters(0.5, seed, hh_cap);
+        force_full_depth_insert(&mut sketch, b"abcdefgh", 5.0);
+        let prefix = b"abcde";
+        let mut before = sketch.top_completions(prefix, 2);
+        assert!(!before.is_empty());
+        sort_completions(&mut before);
+
+        let mut splitter = GpsSketch::with_heavy_hitters(0.5, seed, hh_cap);
+        force_full_depth_insert(&mut splitter, b"abcde", 1.0);
+        zero_out_tree(&mut splitter.root, splitter.heavy_capacity);
+
+        sketch.merge_from(&splitter);
+
+        let mut after = sketch.top_completions(prefix, 2);
+        sort_completions(&mut after);
+        assert_eq!(before.len(), after.len());
+        for (lhs, rhs) in before.iter().zip(after.iter()) {
+            assert_eq!(lhs.0, rhs.0);
+            assert_close(lhs.1, rhs.1, 1e-9);
+        }
     }
 
     #[test]

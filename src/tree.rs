@@ -157,6 +157,10 @@ impl MisraGries {
         items
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub(crate) fn iter_entries(&self) -> impl Iterator<Item = (&[u8], f64)> {
         self.entries
             .iter()
@@ -192,24 +196,20 @@ impl MisraGries {
     }
 
     fn compress_to_capacity(&mut self) {
-        const EPS: f64 = 1e-12;
         if self.entries.is_empty() {
             self.index.clear();
             return;
         }
-        while self.entries.len() > self.capacity {
-            let min_weight = self
-                .entries
-                .iter()
-                .fold(f64::INFINITY, |acc, entry| acc.min(entry.weight));
-            if !min_weight.is_finite() {
-                break;
-            }
-            for entry in self.entries.iter_mut() {
-                entry.weight -= min_weight;
-            }
-            self.entries.retain(|entry| entry.weight > EPS);
+        if self.entries.len() <= self.capacity {
+            self.rebuild_index();
+            return;
         }
+        self.entries.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        self.entries.truncate(self.capacity);
         self.rebuild_index();
     }
 }
@@ -331,12 +331,32 @@ pub(crate) fn prune_node(alpha: f64, node: &mut Node, depth: usize, threshold: f
     let mut removed = 0;
     let mut i = 0;
     while i < node.children.len() {
-        let child_depth = depth + node.children[i].label.len();
-        let estimate = node.children[i].child.sum / inclusion_prob(alpha, child_depth);
-        if estimate.abs() < threshold {
-            removed += node.children[i].child.count_prefixes();
-            removed += node.children[i].mid_sums.len();
-            node.children.remove(i);
+        let (child_est, max_mid_est, child_depth) = {
+            let edge = &node.children[i];
+            let child_depth = depth + edge.label.len();
+            let q_child = inclusion_prob(alpha, child_depth);
+            let child_est = if q_child == 0.0 {
+                0.0
+            } else {
+                edge.child.sum / q_child
+            };
+            let mut max_mid_est: f64 = 0.0;
+            for (offset, raw) in edge.mid_sums.iter().enumerate() {
+                let mid_depth = depth + offset + 1;
+                let q_mid = inclusion_prob(alpha, mid_depth);
+                if q_mid == 0.0 {
+                    continue;
+                }
+                let estimate = raw / q_mid;
+                max_mid_est = max_mid_est.max(estimate.abs());
+            }
+            (child_est, max_mid_est, child_depth)
+        };
+
+        if child_est.abs().max(max_mid_est) < threshold {
+            let edge = node.children.remove(i);
+            removed += edge.child.count_prefixes();
+            removed += edge.mid_sums.len();
         } else {
             removed += prune_node(
                 alpha,
@@ -500,4 +520,68 @@ pub(crate) fn ensure_edge(
 
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_retains_mid_edge_signal() {
+        let mut root = Node::new(None);
+        let mut edge = Edge {
+            label: vec![b'a', b'b', b'c'],
+            mid_sums: vec![10.0, 0.1],
+            child: Box::new(Node::new(None)),
+        };
+        edge.child.sum = 0.01;
+        root.children.push(edge);
+
+        let removed = prune_node(0.5, &mut root, 0, 5.0);
+        assert_eq!(removed, 0);
+        assert_eq!(root.children.len(), 1);
+    }
+
+    #[test]
+    fn prune_counts_include_mid_edges() {
+        let mut root = Node::new(None);
+
+        let mut keeper = Edge {
+            label: vec![b'k', b'e', b'e', b'p'],
+            mid_sums: vec![2.0, 0.0, 0.0],
+            child: Box::new(Node::new(None)),
+        };
+        keeper.child.sum = 0.05;
+        root.children.push(keeper);
+
+        let mut dropped = Edge {
+            label: vec![b'x', b'y'],
+            mid_sums: vec![0.01],
+            child: Box::new(Node::new(None)),
+        };
+        dropped.child.sum = 0.01;
+        root.children.push(dropped);
+
+        let removed = prune_node(0.5, &mut root, 0, 1.0);
+        assert_eq!(removed, 2); // 1 mid-edge accumulator + 1 leaf node
+        assert_eq!(root.children.len(), 1);
+    }
+
+    #[test]
+    fn misra_gries_merge_caps_capacity() {
+        let mut left = MisraGries::new(32);
+        let mut right = MisraGries::new(32);
+        for i in 0..64 {
+            let key = vec![b'a', i as u8];
+            left.update(&key, 1.0 + i as f64);
+        }
+        for i in 64..128 {
+            let key = vec![b'b', i as u8];
+            right.update(&key, 1.0 + i as f64);
+        }
+
+        left.merge_from(&right);
+        assert!(left.entries.len() <= 32);
+        assert_eq!(left.index.len(), left.entries.len());
+    }
 }

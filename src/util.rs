@@ -8,7 +8,8 @@ pub(crate) fn inclusion_prob(alpha: f64, depth: usize) -> f64 {
     if depth <= 1 {
         return 1.0;
     }
-    fast_pow(alpha, depth - 1).max(f64::MIN_POSITIVE)
+    let prob = fast_pow(alpha, depth - 1);
+    if prob < f64::MIN_POSITIVE { 0.0 } else { prob }
 }
 
 pub(crate) fn probability_to_hash_threshold(probability: f64) -> u128 {
