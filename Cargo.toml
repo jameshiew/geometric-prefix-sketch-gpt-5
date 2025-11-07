@@ -8,3 +8,8 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [dev-dependencies]
 rand = "0.8"
+criterion = { version = "0.5", features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "gps"
+harness = false
