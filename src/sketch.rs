@@ -338,6 +338,22 @@ mod tests {
     use rand::prelude::*;
     use std::collections::HashMap;
 
+    fn force_full_depth_insert(sketch: &mut GpsSketch, key: &[u8], delta: f64) {
+        if delta == 0.0 {
+            return;
+        }
+        sketch.root.sum += delta;
+        sketch.root.update_heavy_hitters(key, delta);
+        super::add_inner(
+            &mut sketch.root,
+            key,
+            0,
+            key.len(),
+            delta,
+            sketch.heavy_capacity,
+        );
+    }
+
     fn assert_close(a: f64, b: f64, tol: f64) {
         assert!((a - b).abs() <= tol, "{a} vs {b} (tol {tol})");
     }
@@ -371,6 +387,25 @@ mod tests {
         let mut merged = left.clone();
         merged.merge_from(&right);
         for prefix in ["", "a", "al", "b", "ga", "alphabet"] {
+            assert_close(merged.estimate(prefix), combined.estimate(prefix), 1e-9);
+        }
+    }
+
+    #[test]
+    fn merge_splits_compressed_edges_when_needed() {
+        let mut left = GpsSketch::default();
+        let mut right = GpsSketch::default();
+        let mut combined = GpsSketch::default();
+
+        force_full_depth_insert(&mut left, b"abcdefg", 1.0);
+        force_full_depth_insert(&mut right, b"abcdexy", 1.0);
+        force_full_depth_insert(&mut combined, b"abcdefg", 1.0);
+        force_full_depth_insert(&mut combined, b"abcdexy", 1.0);
+
+        let mut merged = left.clone();
+        merged.merge_from(&right);
+
+        for prefix in ["abcde", "abcdef", "abcdex"] {
             assert_close(merged.estimate(prefix), combined.estimate(prefix), 1e-9);
         }
     }

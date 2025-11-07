@@ -336,22 +336,79 @@ pub(crate) fn merge_nodes(dst: &mut Node, src: &Node, heavy_capacity: Option<usi
         _ => {}
     }
 
-    'outer: for child in &src.children {
-        for existing in &mut dst.children {
-            if existing.label == child.label {
-                for (a, b) in existing.mid_sums.iter_mut().zip(&child.mid_sums) {
-                    *a += b;
+    for child in &src.children {
+        merge_edge_into(dst, child, heavy_capacity);
+    }
+}
+
+fn merge_edge_into(dst: &mut Node, src_edge: &Edge, heavy_capacity: Option<usize>) {
+    merge_edge_segment(
+        dst,
+        &src_edge.label,
+        &src_edge.mid_sums,
+        src_edge.child.as_ref(),
+        heavy_capacity,
+    );
+}
+
+fn merge_edge_segment(
+    dst: &mut Node,
+    label: &[u8],
+    mid_sums: &[f64],
+    child: &Node,
+    heavy_capacity: Option<usize>,
+) {
+    if label.is_empty() {
+        merge_nodes(dst, child, heavy_capacity);
+        return;
+    }
+    debug_assert_eq!(mid_sums.len(), label.len().saturating_sub(1));
+
+    if let Some(idx) = dst
+        .children
+        .iter()
+        .position(|edge| edge.label[0] == label[0])
+    {
+        loop {
+            let edge = &mut dst.children[idx];
+            let lcp = common_prefix_len(&edge.label, label);
+            if lcp == 0 {
+                break;
+            }
+            if lcp == edge.label.len() && lcp == label.len() {
+                for (dst_mid, src_mid) in edge.mid_sums.iter_mut().zip(mid_sums.iter()) {
+                    *dst_mid += src_mid;
                 }
-                merge_nodes(
-                    existing.child.as_mut(),
-                    child.child.as_ref(),
+                merge_nodes(edge.child.as_mut(), child, heavy_capacity);
+                return;
+            }
+            if lcp == edge.label.len() {
+                for (dst_mid, src_mid) in edge.mid_sums.iter_mut().zip(mid_sums.iter()) {
+                    *dst_mid += src_mid;
+                }
+                debug_assert!(lcp > 0 && lcp <= mid_sums.len());
+                let boundary = mid_sums[lcp - 1];
+                edge.child.sum += boundary;
+                merge_edge_segment(
+                    edge.child.as_mut(),
+                    &label[lcp..],
+                    &mid_sums[lcp..],
+                    child,
                     heavy_capacity,
                 );
-                continue 'outer;
+                return;
             }
+            edge.split(lcp, heavy_capacity);
+            // After splitting, the same edge now carries the common prefix,
+            // so re-evaluate against the source segment.
         }
-        dst.children.push(child.clone());
     }
+
+    dst.children.push(Edge {
+        label: label.to_vec(),
+        mid_sums: mid_sums.to_vec(),
+        child: Box::new(child.clone()),
+    });
 }
 
 pub(crate) fn ensure_edge<'a>(

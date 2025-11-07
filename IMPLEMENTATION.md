@@ -64,14 +64,20 @@ memory (one hash entry per tracked suffix) for predictable speed.
 
 ### 4. Merge strategy
 The first implementation replayed every prefix via `add_raw_sum`, which was
-O(n log n). The current version merges tries structurally:
+O(n log n). The current version merges tries structurally and now handles
+compressed-edge divergence correctly:
 
 - Node sums are added directly.
-- Mid-edge accumulators are summed when labels match.
-- Children are cloned when unique, or recursed into when shared.
+- When two compressed edges share a partial prefix, the destination edge is
+  split at the LCP so the shared bytes’ `mid_sums` and node sums can be added
+  before recursing into the remainder.
+- Children are cloned only when truly unique; otherwise we recurse into the
+  shared node after rescaling the boundary accumulator.
 
-This keeps merge cost linear in the number of realized prefixes and aligns with
-DESIGN.md’s “merge by addition” statement.
+This keeps merge cost linear in the number of realized prefixes, guarantees the
+resulting trie stays compressed/canonical, and aligns with DESIGN.md’s “merge by
+addition” statement even when shards see diverging suffixes beyond
+`PROMOTION_DEPTH`.
 
 ### 5. Accuracy guardrails
 DESIGN.md touts unbiased estimators but doesn’t specify testing methodology. We
@@ -81,6 +87,9 @@ added `tests/accuracy.rs`, which:
 - Tracks exact counts for shallow prefixes.
 - Asserts that depth-1 prefixes are exact (because `alpha=0.5` ⇒ `q(1)=1`).
 - Enforces <15% relative error for high-support prefixes (≥200 true count).
+- Adds targeted regression coverage (`merge_splits_compressed_edges_when_needed`)
+  so merges stay correct even when long suffixes diverge past
+  `PROMOTION_DEPTH`.
 
 This ensures probabilistic behavior matches theory under a representative
 workload.
