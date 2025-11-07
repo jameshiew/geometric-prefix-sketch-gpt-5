@@ -223,8 +223,8 @@ pub(crate) fn add_inner(
     }
 }
 
-pub(crate) fn locate_raw_sum<'a>(
-    node: &'a Node,
+pub(crate) fn locate_raw_sum(
+    node: &Node,
     prefix: &[u8],
     depth: usize,
 ) -> Option<(f64, usize)> {
