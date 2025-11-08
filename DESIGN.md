@@ -30,27 +30,28 @@ Consider keys as strings over an alphabet (bytes, UTF‑8 code units, bits for i
 Each realized trie node `P` stores:
 
 * `S(P)`: a **sampled (unscaled)** accumulator for the sum/count under prefix `P`. We add `Δ` to `S(P)` whenever `P` is visited; the unbiased estimate divides by the inclusion probability \(q(|P|)\) at query time.
-* (Optional) a tiny **heavy‑hitter summary** implemented as a bounded top‑k compactor (think “keep the `k` heaviest suffixes seen so far”). It merges by summing shared keys and re‑truncating to capacity, and it only sees the Bernoulli subsample induced by depth `|P|`. It is **not** a strict Misra‑Gries guarantee; if you need deterministically bounded error, swap in an actual MG/SpaceSaving variant.
-* Child pointers (we recommend a **compressed trie**/radix node to pack runs of characters).
+* (Optional) a tiny **heavy-hitter summary** implemented as a bounded top-k compactor (think “keep the `k` heaviest suffixes seen so far”). It merges by summing shared keys and re-truncating to capacity, and it only sees the Bernoulli subsample induced by depth `|P|`. It is **not** a strict Misra-Gries guarantee; if you need deterministically bounded error, swap in an actual MG/SpaceSaving variant.
+* Child pointers (we recommend a **compressed trie**/radix node to pack runs of characters). Every compressed edge stores `mid_sums` for each interior prefix so queries that stop mid-edge still recover their sampled accumulator without forcing a structural split.
 
 We fix a geometric parameter `α ∈ (0,1)` that tunes cost vs. accuracy (think `α = 1/2` by default).
 
 Define
 
-* Sampling distribution over positive integers (L \ge 1):
+* Sampling distribution over nonnegative depths:
   [
-\Pr[L \ge \ell] = q(\ell) = \alpha^{\ell-1}, \quad
-\Pr[L=\ell] = (1-\alpha)\,\alpha^{\ell-1}.
+\Pr[L \ge 0] = q(0) = 1, \quad q(1) = 1,\quad
+\Pr[L \ge \ell] = q(\ell) = \alpha^{\ell-1}\; (\ell>1),\quad
+\Pr[L=\ell] = (1-\alpha)\,\alpha^{\ell-1} \text{ for } \ell \ge 1.
   ]
 * For a prefix of length (\ell), we’ll need the factor (q(\ell)).
 
-**Deterministic sampling from the key.** To make updates repeatable and shard‑mergeable, we compute (L) **deterministically** from a 64‑bit hash of the key: e.g., let `u` be the hash viewed as a fixed‑point uniform in (0,1); then
+**Deterministic sampling from the key.** To make updates repeatable and shard-mergeable, we compute (L) **deterministically** from a 128-bit hash of the key: e.g., let `u` be the hash viewed as a fixed-point uniform in (0,1); then
 [
 L = 1 + \left\lfloor \frac{\ln u}{\ln \alpha} \right\rfloor,
 ]
 truncated at (|key|). (With (\alpha=1/2), this is just **1 + number‑of‑leading‑zeros** in the hash until the first 1‑bit—exactly like HyperLogLog’s `rho` function—capped by the key length. That makes `L` sampling **branchless** and fast.)
 
-> Use a **keyed** 64‑bit hash (e.g., SplitMix64/SipHash with a shared seed). All shards must share the seed to stay deterministic, and the keying defends against adversarial keys.
+> Use a **keyed** 128-bit hash (XXH3-128 with a shared seed in this implementation). All shards must share the seed to stay deterministic, and the keying defends against adversarial keys. The reference Rust crate’s `GpsSketch::default()` intentionally chooses a random seed for adversarial resistance; call the explicit `with_seed`/`with_heavy_hitters` constructors when you need shard merges so everyone agrees on `(\alpha, \text{seed})`.
 
 ---
 
@@ -60,13 +61,13 @@ truncated at (|key|). (With (\alpha=1/2), this is just **1 + number‑of‑leadi
 
 Adds value `Δ` (often 1 for counting). Let `s` be the key, length `|s|`.
 
-1. Compute `h = Hash64(s)`.
+1. Compute `h = Hash128(s)`.
 2. Compute `L = sample_level(h, α)` as above; set `L = min(L, |s|)`.
 3. Walk the trie from the root for the **first `L` characters** of `s`, creating compressed nodes if missing. At each visited prefix node `P` (depth `ℓ`):
 
    * Update the **sampled** sum:
      `S(P) += Δ`  (we store the raw sampled total and scale only at query time)
-   * (Optional) Update `P`’s top‑k compactor with the **remaining suffix** (or the full key), weight `Δ`. The summary therefore tracks a Bernoulli subsample at this depth; multiply reported weights by \(1/q(|P|)\) when displaying. Because the compactor is nonlinear (truncate-to-capacity), we simply add sampled weights and scale on readback; it does **not** inherit Misra‑Gries frequency guarantees, only “keep the heaviest things we saw.”
+   * (Optional) Update `P`’s top-k compactor with the **remaining suffix** (or the full key), weight `Δ`. Only **positive** weights are inserted (`Δ \le 0` is ignored) so the summary stays insertion-only. The sketch therefore tracks a Bernoulli subsample at this depth; multiply reported weights by the inclusion factor used by that summary when displaying. Because the compactor is nonlinear (truncate-to-capacity), we simply add sampled weights and scale on readback; it does **not** inherit Misra-Gries frequency guarantees, only “keep the heaviest things we saw.”
 
 **Why is this unbiased?**
 For any fixed prefix (P) of length (\ell), a key under (P) contributes to `S(P)` **iff** (L \ge \ell), which happens with probability (q(\ell)=\alpha^{\ell-1}). If we define the estimated sum at query time as ( \widehat{A}(P) = S(P)/q(\ell) ), then for each key with contribution (\Delta),
@@ -80,15 +81,13 @@ so the estimate is **unbiased**.
 
 ### Delete / add(key, −Δ)
 
-Same as insert (deterministic `L`), but subtract.
+Same as insert (deterministic `L`), but subtract. Heavy-hitter summaries stay insertion-only: negative deltas still update the node’s sampled sum but do **not** remove entries from the compactor. This matches the library implementation; if deletions are frequent and you need HH parity, supply a signed sketch variant (e.g., SpaceSaving) per node instead.
 
 ### Query: sum/count under a prefix P
 
-1. Traverse the trie to node `P` (if missing ⇒ estimate 0).
-2. Return
-   [
-   \widehat{A}(P) = \frac{S(P)}{q(|P|)} = \frac{S(P)}{\alpha^{|P|-1}}.
-   ]
+1. Traverse the compressed trie while tracking whether the prefix lands **on a node** or **inside an edge**. If the traversal fails, return 0.
+2. Let `(raw, depth)` be the match: nodes return their stored `S(P)` with `depth = |P|`; mid-edge matches return the appropriate `mid_sums[idx]` bucket with `depth` equal to the matched prefix length (child depth of that bucket).
+3. Return `raw / q(depth)`. By definition `q(0) = q(1) = 1`; for deeper levels the table gives `α^{depth-1}` until the realizable cap, after which `q(depth)=0` and the estimate is defined to be 0.
 
 **Variance & relative error.** Let (q = q(|P|) = \alpha^{|P|-1}).
 
@@ -107,20 +106,29 @@ where (N_{\text{eff}} = (\sum_s w_s)^2 / \sum_s w_s^2) is the **effective** numb
 
 Because (q(1)=1) for any (\alpha), depth‑1 totals are always exact. Raising (\alpha) improves accuracy for deeper depths at the cost of higher expected update work ((1/(1-\alpha))); lowering (\alpha) does the opposite.
 
-### Top‑k under a prefix
+### Top-k under a prefix
 
-At node `P`, query the local heavy‑hitter sketch (updated only when `P` was touched, i.e., with probability (q(|P|)) per key). The sketch naturally tracks frequent **completions** under `P`. You can scale counts by (1/q(|P|)) to unbias.
+At node `P`, query the local heavy-hitter sketch (updated only when `P` was touched, i.e., with probability (q(|P|)) per key). When the query ends **mid-edge**, append the remaining edge label first and then consult the downstream child’s summary; the summary’s depth is the child depth, not the user-specified prefix. Scale reported weights by \(1/q(d_{\text{summary}})\), where `d_summary` equals the depth of the node that owns the heavy-hitter sketch. Because these sketches are insertion-only, weights reported after deletions may diverge from the unbiased `estimate(P)` result.
 
-> Note: The bounded top‑k compactor is **nonlinear**. Scaling its reported weights by \(1/q(|P|)\) adjusts magnitudes but does not make the top‑k set itself unbiased. In practice, heavy items stay heavy under Bernoulli subsampling, and the compactor remains mergeable because we simply add shared suffixes and truncate back to capacity.
+> Note: The bounded top-k compactor is **nonlinear** and insertion-only. Scaling its reported weights by \(1/q(d_{\text{summary}})\) adjusts magnitudes but does not make the top-k set itself unbiased. In practice, heavy items stay heavy under Bernoulli subsampling, and the compactor remains mergeable because we simply add shared suffixes and truncate back to capacity.
 
 ### Merge (distributed)
 
 Because inclusion decisions and levels are **deterministic from the key hash**, two GPS structures built on disjoint streams can be merged by **pointwise addition** of:
 
 * `S` at corresponding trie nodes
-* (optional) heavy‑hitter sketches (mergeable sketches or simple sum of Count‑Min tables)
+* (optional) heavy-hitter sketches (mergeable sketches or simple sum of Count-Min tables)
 
-No global coordination is required.
+When the tries are compressed, merging also has to respect **edge boundaries**:
+
+1. For every incoming compressed edge, find the destination edge that shares the same first byte.
+2. Walk down while the labels match. If they match exactly, add `mid_sums` elementwise and recurse into the child.
+3. If the match ends mid-label (partial overlap), **split** the destination edge at the longest common prefix. Add overlapping `mid_sums` for the shared interior buckets.
+4. Move the overlapping boundary accumulator (`mid_sums[lcp-1]`) into the child node’s `S` before recursing so that the promoted node stores the correct raw mass.
+
+This keeps the trie canonical and preserves unbiased estimates even when merges introduce new branching points along a compressed edge.
+
+No global coordination is required beyond agreeing on `(\alpha,\text{seed}[,\text{hh capacity}])`. Remember the crate’s default constructor randomizes the seed; call `with_seed`/`with_heavy_hitters` when you intend to merge shards.
 
 > **Promotion caveat:** if you “promote” select prefixes to exact maintenance (forcing \(q=1\) for them), keep that list deterministic and shared across shards; otherwise merges could introduce bias.
 
@@ -130,19 +138,26 @@ No global coordination is required.
 
 ### Node layout
 
-Use a **compressed radix node** (like a succinct Patricia trie):
+Use a **compressed radix trie** (Patricia) with explicit edges:
 
 ```text
 struct Node {
-  string edge_label;        // compressed run (could be slice into an arena)
   double S;                 // sampled (unscaled) sum; int64 works if counts only
-  Children children;        // sorted small vector or array-mapped (HAMT-like)
+  Edge[] children;          // sorted small vector or array-mapped (HAMT-like)
   Optional<HHSketch> hh;    // tiny bounded top-k compactor (optional)
+}
+
+struct Edge {
+  string label;             // compressed run (slice into arena)
+  double mid_sums[label.len()-1]; // raw sums for every interior prefix on this edge
+  Node child;               // subtree after the label
 }
 ```
 
+Every realized prefix lives either on a node (`S`) or inside an edge (`mid_sums[i]`). Mid-edge accumulators are crucial: a query that stops in the middle of a compressed label must still return the sampled mass collected at that interior depth, so we materialize that accumulator in `mid_sums` rather than forcing a node split.
+
 * **Arena allocation** for node/edge storage.
-* **Children**: for byte alphabets, a tiny 256‑bit bitmap + packed child array is fast; for UTF‑8 or general alphabets, a sorted small vector (binary search) is usually fine.
+* **Children**: for byte alphabets, a tiny 256-bit bitmap + packed child array is fast; for UTF-8 or general alphabets, a sorted small vector (binary search) is usually fine.
 
 ### Sampling function (branchless, (\alpha=1/2))
 
@@ -167,11 +182,17 @@ from other shards or higher α to get sampled mass.
 
 For general (\alpha), either map a uniform (u) via (\lfloor \log(u) / \log(\alpha)\rfloor + 1) or use a tiny lookup table for (q(\ell)=\alpha^{\ell-1}) to avoid `log`.
 
+### Depth caps & zeroed tails
+
+* **α = 0.5 (fast path):** Counting leading zeros across 128 hash bits yields at most 128 zeros, so the realizable depth is \(L \le 129\). Any sampled depth beyond that is clamped to 129, and the sampler also caps by the key length.
+* **General α:** The inclusion table stores `q(ℓ)` up to a configurable bound (200 000 entries in the reference implementation) and defines `q(ℓ) = 0` beyond that. Insertions therefore clamp `L` to `min(|key|, max_realizable_depth)`.
+* **Queries:** Because `q(depth)=0` past the realizable cap, estimates deeper than the table deterministically return 0. This keeps memory bounded for high-α sketches while making the specification explicit about how “too-deep” prefixes behave.
+
 ### Insert pseudocode
 
 ```pseudo
 function insert(key, Δ, α=0.5):
-    h  = Hash64(key)
+    h  = Hash128(key)
     L  = sample_geometric_level(h, α)
     L  = min(L, len(key))
     node = root
@@ -183,24 +204,30 @@ function insert(key, Δ, α=0.5):
         off   += consumed
         depth += number_of_chars_in(consumed)
         node.S += Δ                 // sampled (unscaled) accumulator
-        if node.hh exists:
-            node.hh.update(key, Δ)  // HH sketch runs on this Bernoulli subsample
+        if node.hh exists and Δ > 0:
+            node.hh.update(key, Δ)  // HH sketch only tracks positive deltas
 ```
 
 ### Query pseudocode
 
 ```pseudo
 function estimate_prefix_sum(prefix, α=0.5):
-    node = find(prefix)
-    if node == null: return 0
-    depth = length_in_chars(prefix)
+    match = locate(prefix)
+    if match == null: return 0
+    if match is Node:
+        depth = length_in_chars(prefix)
+        raw = match.node.S
+    else:
+        depth = match.depth
+        raw = match.mid_bucket
     q = α^(depth-1)
-    return node.S / q
+    if q == 0: return 0
+    return raw / q
 ```
 
-> **Note on scaling:** We store `S(P)` as the raw sampled total (ints or f64). At query time we divide by \(q(|P|)\). If you need integer‑only outputs, precompute reciprocals (or fixed‑point factors) per depth and apply them on read.
+> **Note on scaling:** We store `S(P)`/`mid_sums` as raw sampled totals. At query time we divide by the inclusion probability of the matched depth `q(depth)`. If you need integer-only outputs, precompute reciprocals (or fixed-point factors) per depth and apply them on read.
 
-> **Depth cap trade-off:** For (α \to 1) the inclusion table would otherwise grow without bound, so we cap the realizable depth at 200 000 entries. Any depth beyond that is defined to have \(q = 0\) and therefore estimates to zero. This keeps memory bounded while allowing high-α sketches to function; it simply means “requested prefixes deeper than the table” behave as if they were never sampled.
+> **Depth cap trade-off:** See “Depth caps & zeroed tails” for the precise limits. Practically, the table stops after ~200 000 entries (general α) or 129 entries (α=0.5), so `q(depth)=0` beyond that and estimates are fixed at zero.
 
 ---
 
@@ -262,7 +289,7 @@ function estimate_prefix_sum(prefix, α=0.5):
 * **Parameter choice.** Start with (\alpha=0.5). If you need higher fidelity at deeper levels (e.g., 3–5 chars), try 0.6–0.7; watch update cost ((1/(1-\alpha))).
 * **Integer ranges.** Implement a bit‑trie front end: a 64‑bit unsigned splits naturally into 64 levels; GPS updates only a constant expected number of levels; range queries decompose into (\le 2\log U) prefixes—sum their estimates.
 * **Bias/variance tuning.** You can make depth‑dependent (\alpha_\ell) (e.g., slower decay beyond depth 4) by reading more bits from the hash to sample from a *piecewise geometric* distribution; same analysis applies with (q(\ell)=\Pr[L\ge\ell]).
-* **Heavy hitters.** A truncate-to-capacity top-k compactor with capacity 8–16 per node gives good completions; scale estimates by \(1/q(|P|)\). The summary is nonlinear, so scaling fixes magnitudes but not the set itself—good enough because heavy items stay heavy under the subsample. If you need deterministic frequency guarantees, plug in a true Misra-Gries or SpaceSaving variant.
+* **Heavy hitters.** A truncate-to-capacity top-k compactor with capacity 8–16 per node gives good completions; scale estimates by \(1/q(d_{\text{summary}})\) where `d_summary` is the depth of the node that owns the summary (child depth for mid-edge prefixes). The summary is nonlinear and insertion-only, so scaling fixes magnitudes but not the set; if you need deterministic frequency guarantees or deletions, plug in a true Misra-Gries/SpaceSaving variant per node.
 
 *Mid-edge HH behavior.* When a query prefix ends in the middle of a compressed edge, we first append the remaining edge label so we can consult the downstream node’s summary. Only the suffixes observed at that child participate—updates that stopped exactly at the mid-edge accumulator never enter that HH summary—so the completions you see are always of the form `prefix + remaining_edge + hh_suffix`.
 * **Promotion policy.** If you “promote” certain prefixes to exact maintenance (force \(q=1\)), keep the policy deterministic and shared across shards so merges stay unbiased.
@@ -279,6 +306,7 @@ function estimate_prefix_sum(prefix, α=0.5):
   * **On‑demand promotion:** if a prefix is frequently queried, start *exactly* maintaining that node: on future updates, always touch it (set (q(\ell)=1) for that specific node).
 * **Repeated keys inflate variance under per‑key sampling.** When the same key appears many times, all of its occurrences are either sampled or not together, so variance scales with \(\sum_s w_s^2\). Mitigate by bumping \(\alpha\), promoting hot prefixes, or (if you have a stable per‑event identifier) hashing on `(key, event_id)` to get per‑occurrence sampling.
 * **Counts only (sums of nonnegative values).** For signed updates (turnstile with cancellations), the estimator remains unbiased, but variance adds; use wider counters or float.
+* **Insertion-only heavy hitters.** The default HH compactor never subtracts weight when you apply negative deltas. After deletions, its reported weights can lag the unbiased `estimate(P)` values. If this matters, either disable HH summaries or replace them with a signed sketch (e.g., SpaceSaving with explicit decrements).
 
 ---
 
@@ -300,17 +328,24 @@ to deliver **unbiased prefix sums with O(1) expected update work** and trivial d
 ```pseudo
 // Globals
 α in (0,1)
-q(depth) = α^(depth-1)
+MAX_DEPTH = realizable_depth(α)  // 129 when α=0.5, else inclusion-table size (~200k)
+q(depth) =
+    if depth <= 1: 1
+    else if depth > MAX_DEPTH: 0
+    else α^(depth-1)
 
-function sample_level(hash64 h, α):
-    // Convert to uniform u in (0,1)
-    u = (h + 1) / 2^64
-    // Geometric tail: floor( ln(u)/ln(α) ) + 1
-    L = 1 + floor(log(u) / log(α))
-    return max(1, L)
+function sample_level(hash128 h, α):
+    if α == 0.5:
+        L = 1 + clz128(h)
+    else:
+        // Convert to uniform u in (0,1)
+        u = (h + 1) / 2^128
+        // Geometric tail: floor( ln(u)/ln(α) ) + 1
+        L = 1 + floor(log(u) / log(α))
+    return min(MAX_DEPTH, max(1, L))
 
 function add(key s, Δ):
-    h = Hash64(s)
+    h = Hash128(s)
     L = min(sample_level(h, α), |s|)
     node = root
     depth = 0
@@ -320,13 +355,20 @@ function add(key s, Δ):
         i     += bytes(consumed_chars)
         depth += consumed_chars
         node.S += Δ                  // sampled accumulator
-        // optional: node.hh.update(s, Δ)
+        if node.hh exists and Δ > 0:
+            node.hh.update(s, Δ)
 
 function estimate(prefix p):
-    node = find(prefix p)
-    if node == null: return 0
-    depth = |p|
-    return node.S / q(depth)
+    match = locate(prefix p)
+    if match == null: return 0
+    if match is Node:
+        depth = |p|
+        raw   = match.node.S
+    else:
+        depth = match.depth
+        raw   = match.mid_bucket
+    if q(depth) == 0: return 0
+    return raw / q(depth)
 ```
 
 You can implement this directly and validate it today.
