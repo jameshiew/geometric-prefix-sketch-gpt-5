@@ -20,8 +20,9 @@ public API surface minimal.
 
 | DESIGN element | Status | Notes |
 | -------------- | ------ | ----- |
-| Geometric depth sampling (Horvitz–Thompson rescaling) | ✅ Implemented. | `GpsSketch::add` samples a max depth using XXH3-128 leading-zero counts (`α=0.5` realizable depths stop at 129) and, for general `α`, a precomputed inclusion table capped at 200 000 entries where deeper levels are defined to have `q=0`; queries rescale by `alpha^(depth-1)`.
+| Geometric depth sampling (Horvitz–Thompson rescaling) | ✅ Implemented. | `GpsSketch::add` turns the XXH3-128 hash into a Q128 integer. For `α = 0.5` we take `1 + clz128(h)` (clamped at 129); for every other `α` we walk a precomputed table of fixed-point thresholds (`q128[d] = ⌊α^{d-1} · 2^128⌋`) up to 200 000 entries. Depths beyond that return `q = 0`, so queries deterministically return 0 rather than underflow. 
 | Deterministic hashing | ✅ Implemented. | `util::deterministic_hash` uses `xxh3_128_with_seed` so shards merge safely. `GpsSketch::default()` now sources a secure random seed; use `with_seed(alpha, seed)` when deterministic merging is required.
+| Constructors & seeding semantics | ✅ Implemented. | `GpsSketch::default()` → random seed (best for adversarial keys), `GpsSketch::with_seed(alpha, seed)` → explicit seed for shard merges, `GpsSketch::new(alpha)` → fixed seed `0` for legacy deterministic behavior. `with_heavy_hitters` forwards whichever seed you choose.
 | Compressed radix trie with mid-edge mass | ✅ Implemented (see `tree.rs`). | Nodes hold `sum` plus edges with `label` and `mid_sums`. Node promotion depth currently hard-coded at 4 (`PROMOTION_DEPTH`).
 | Heavy-hitter sketches per node | ✅ Optional. | A truncate-to-capacity top-k compactor stores the heaviest suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates and merges summaries by summing shared suffixes then truncating back to capacity. Only positive deltas feed the HH stream so completions never inherit negative mass.
 | Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. Heavy hitters reuse the same sum-then-truncate compactor merge so results are order-invariant. Callers must still match `alpha`, `hash_seed`, and HH capacity (the code `assert!`s every merge).
@@ -29,12 +30,21 @@ public API surface minimal.
 | Examples/benchmarks | ✅ `examples/` + Criterion benches. | Provide runnable demos and performance harnesses.
 | Accuracy/integration testing | ✅ `tests/accuracy.rs`. | Ensures estimates align with exact counts on random data (with a tolerance for deep prefixes).
 
+## Constructors & seeding semantics
+
+- `GpsSketch::default()` calls `with_random_seed`, drawing entropy via `getrandom`. Use this when adversarial keys are a concern; capture the chosen seed before merging sketches so every shard agrees on sampling decisions.
+- `GpsSketch::with_seed(alpha, seed)` accepts an explicit `u64` seed and is the recommended constructor for deterministic shard deployments.
+- `GpsSketch::new(alpha)` is retained for backwards compatibility and always uses seed `0`. It is deterministic but adversarially predictable, so prefer `with_seed` unless you need that legacy behavior.
+
+`GpsSketch::with_heavy_hitters` wraps any of the above constructors and forwards the same seed so sums and HH summaries stay mergeable.
+
 ## Not-yet/Partially implemented design ideas
 
 - **Configurable promotion depth:** currently a constant (`PROMOTION_DEPTH = 4`). DESIGN.md suggests adapting it; this is future work.
 - **Alternate alphabets / arenas:** the trie stores `Vec<u8>` for edge labels and allocates per insertion. Switching to arenas or slices would reduce fragmentation but adds complexity.
 - **Advanced heavy-hitter logic (e.g., Count-Min per node):** the current truncate-to-`k` compactor is simple but sufficient for small `k`.
-- **Precision safeguards:** for very deep prefixes (depth > ~40) the inclusion probability underflows toward `f64::MIN_POSITIVE`. DESIGN.md hints at using arbitrary precision or per-depth scaling tables; presently we clamp to `MIN_POSITIVE`, which inflates variance but keeps numbers finite, and we cap the precomputed inclusion table at 200 000 depths so high-`α` sketches cannot allocate unbounded memory (deeper levels are treated as `q = 0`).
+- **Per-node exact maintenance (`q=1`) promotions:** highlighted in DESIGN.md as future work; the current crate only applies the structural promotion depth (unit-byte nodes through `PROMOTION_DEPTH`).
+- **Numerical safeguards near the depth cap:** the inclusion table already zeroes probabilities once they fall below the 128-bit fixed-point threshold, so high-depth queries deterministically return 0. Future work would explore log-space or higher-precision tables instead of the present “set `q=0` beyond the cap” rule.
 
 ## Justifications / trade-offs
 
@@ -80,6 +90,11 @@ Sampling now mirrors the design’s deterministic story exactly:
   Every shard therefore makes identical keep/drop decisions without depending on
   platform rounding quirks.
 
+> Sampling is **per key**, not per occurrence. Because we hash `(key, seed)`
+once, repeated inserts of the same key always share the same sampled depth `L`.
+If you need per-event randomness, include a stable event identifier in the key
+space before hashing.
+
 ### 3. Top-k compactor bookkeeping & merges
 Original DESIGN only said “tiny heavy-hitter sketch”. Instead of a multi-row
 Count-Min, we keep a bounded top-k compactor backed by an auxiliary
@@ -100,14 +115,16 @@ compressed-edge divergence correctly:
   split at the LCP so the shared bytes’ `mid_sums` and node sums can be added
   before recursing into the remainder.
 - Children are cloned only when truly unique; otherwise we recurse into the
-  shared node after rescaling the boundary accumulator.
+  shared node after **adding** the overlapping boundary accumulator to the child
+  sum—no rescaling occurs.
 - Per-node heavy hitters reuse the same sum-then-truncate compactor merge,
   keeping the HH summaries deterministic and order-invariant.
 
 This keeps merge cost linear in the number of realized prefixes, guarantees the
 resulting trie stays compressed/canonical, and aligns with DESIGN.md’s “merge by
 addition” statement even when shards see diverging suffixes beyond
-`PROMOTION_DEPTH`.
+`PROMOTION_DEPTH`. The regression test `merge_boundary_mid_carries_overlap`
+asserts that boundary mass crosses the split exactly once.
 
 ### 5. Accuracy guardrails
 DESIGN.md touts unbiased estimators but doesn’t specify testing methodology. We
@@ -128,6 +145,18 @@ added `tests/accuracy.rs`, which:
 
 This ensures probabilistic behavior matches theory under a representative
 workload.
+
+### Depth caps & unreachable depths
+
+- `α = 0.5` ⇒ `1 + clz128` so realizable depths top out at **129**. Depth-1 is always exact regardless of α; see `depth_one_counts_are_exact_for_general_alpha`.
+- General `α` uses the same sampler but clamps to the 200 000-entry inclusion table. Beyond that, `q(depth) = 0` by construction, so inserts never touch deeper prefixes.
+- Queries follow the same rule: if `q(depth) = 0`, we return 0 immediately instead of risking floating-point underflow. The regression `unreachable_depth_estimates_to_zero` verifies this behavior.
+
+### Heavy-hitter caveats (current behavior)
+
+- **Insertion-only summaries.** `TopKCompactor::update` ignores non-positive deltas, so HH weights can lag `estimate()` after deletions. Callers who need signed guarantees must provide a different sketch.
+- **Mid-edge queries scale at the child depth.** `top_completions` stitches the remaining edge label onto the prefix, consults the downstream node’s compactor, and multiplies by \(1/q(\text{child depth})\). `mid_edge_top_completions_use_child_depth` keeps this invariant honest.
+- **Merges = sum + truncate.** `top_k_compactor_merge_is_order_invariant` shows that HH merges simply add overlapping suffixes and re-truncate to capacity, so order doesn’t perturb results even though the summaries are nonlinear.
 
 ### 6. Examples & documentation
 To make the crate usable without reading the entire design paper, we added:
@@ -153,7 +182,7 @@ new enough to enable that edition before running builds or tests.
 ## Future Work
 
 1. Configurable promotion depth & arena allocation.
-2. More numerically stable inclusion probabilities (per-depth table).
+2. Alternative numerics near the table cap (e.g., log-space or 256-bit fixed point) to squeeze a few extra depths before `q` underflows to zero.
 3. Alternative heavy-hitter sketches (Count-Min, etc.) plug-ins.
 4. Streaming/backpressure interface for pruning/compaction.
 5. Extended sampler that chains additional deterministic blocks when all 128 bits are zero, removing the 129-depth ceiling for `α = 0.5`.

@@ -45,13 +45,24 @@ Define
   ]
 * For a prefix of length (\ell), we’ll need the factor (q(\ell)).
 
-**Deterministic sampling from the key.** To make updates repeatable and shard-mergeable, we compute (L) **deterministically** from a 128-bit hash of the key: e.g., let `u` be the hash viewed as a fixed-point uniform in (0,1); then
-[
-L = 1 + \left\lfloor \frac{\ln u}{\ln \alpha} \right\rfloor,
-]
-truncated at (|key|). (With (\alpha=1/2), this is just **1 + number‑of‑leading‑zeros** in the hash until the first 1‑bit—exactly like HyperLogLog’s `rho` function—capped by the key length. That makes `L` sampling **branchless** and fast.)
+**Deterministic sampling from the key.** To keep updates repeatable and shard-mergeable, we compute (L) **solely** from a keyed 128-bit hash of the key. The implementation interprets the hash as an unsigned Q128 value and walks a **precomputed monotone threshold table** `q128[d] ≈ ⌊α^{d-1} · 2^128⌋`. Starting at `d = 1`, advance while `hash < q128[d+1]`, clamping to both the key length and the realizable depth cap (129 for `α=0.5`, or the inclusion-table length for general `α`). This avoids runtime logs, stays integer-only, and guarantees identical behavior across platforms and shards (`sample_level_for_hash` in `src/sketch.rs` mirrors this logic).
 
-> Use a **keyed** 128-bit hash (XXH3-128 with a shared seed in this implementation). All shards must share the seed to stay deterministic, and the keying defends against adversarial keys. The reference Rust crate’s `GpsSketch::default()` intentionally chooses a random seed for adversarial resistance; call the explicit `with_seed`/`with_heavy_hitters` constructors when you need shard merges so everyone agrees on `(\alpha, \text{seed})`.
+* **Fast path for `α = 0.5`.** We still keep the branchless **1 + clz128(hash)** shortcut, capped at 129, because `α^{d-1}` aligns perfectly with powers of two. The full Q128 table is used for every other α.
+* **Executable checks.** `depth_one_counts_are_exact_for_general_alpha` and `alpha_point_five_sampler_matches_leading_zeros` assert the sampler’s determinism and depth limits in the shipped crate.
+
+> **Per-key deterministic sampling only.** The sampler hashes the *key* (plus seed) exactly once, so all occurrences of that key share the same `L`. Variance therefore follows the Horvitz–Thompson expression with \(\sum_s w_s^2\); there is currently no per-occurrence mode.
+
+> Use a **keyed** XXH3-128 hash so every shard agrees on inclusion decisions. Share `(α, seed)` across shards to remain deterministic and adversarially safe.
+
+### Constructors & seeding semantics
+
+The public constructors make those seeding guarantees explicit:
+
+- `GpsSketch::default()` → draws a fresh random seed (great for adversarial resistance; capture the seed before merging).
+- `GpsSketch::with_seed(alpha, seed)` → explicit seed for deterministic shard merges.
+- `GpsSketch::new(alpha)` → fixed seed `0` for legacy/compatibility scenarios (deterministic but adversarially predictable).
+
+`with_heavy_hitters` composes with the above and forwards the seed unchanged; callers decide whether they prefer safety (`default`) or reproducible merges (`with_seed`/`new`).
 
 ---
 
@@ -106,11 +117,19 @@ where (N_{\text{eff}} = (\sum_s w_s)^2 / \sum_s w_s^2) is the **effective** numb
 
 Because (q(1)=1) for any (\alpha), depth‑1 totals are always exact. Raising (\alpha) improves accuracy for deeper depths at the cost of higher expected update work ((1/(1-\alpha))); lowering (\alpha) does the opposite.
 
+**Iteration & root totals.** `iter_estimates()` traverses both node prefixes and mid-edge buckets, applying the same \(1/q(depth)\) scaling, so users see every realized prefix without reimplementing trie walks. `iter_estimates_reports_mid_edge_prefixes` and `iter_estimates_match_raw_traversal` keep that guarantee executable. The depth-0 root is always materialized with `q(0)=1`, so `total()` is exactly `estimate("")`; `empty_key_only_touches_root` covers that invariant by inserting the empty key.
+
 ### Top-k under a prefix
 
 At node `P`, query the local heavy-hitter sketch (updated only when `P` was touched, i.e., with probability (q(|P|)) per key). When the query ends **mid-edge**, append the remaining edge label first and then consult the downstream child’s summary; the summary’s depth is the child depth, not the user-specified prefix. Scale reported weights by \(1/q(d_{\text{summary}})\), where `d_summary` equals the depth of the node that owns the heavy-hitter sketch. Because these sketches are insertion-only, weights reported after deletions may diverge from the unbiased `estimate(P)` result.
 
 > Note: The bounded top-k compactor is **nonlinear** and insertion-only. Scaling its reported weights by \(1/q(d_{\text{summary}})\) adjusts magnitudes but does not make the top-k set itself unbiased. In practice, heavy items stay heavy under Bernoulli subsampling, and the compactor remains mergeable because we simply add shared suffixes and truncate back to capacity.
+
+### Heavy-hitter caveats (current behavior)
+
+- **Insertion-only summaries.** Negative deltas update the unbiased node counters but are ignored by the top-k compactor, so completions can temporarily overstate frequency after deletions. This matches `TopKCompactor::update` and is documented in the public API (`GpsSketch::add` docs).
+- **Mid-edge completions scale at the child depth.** When a query stops mid-edge, we append the remaining edge label, read the child’s summary, and multiply by \(1/q(\text{child depth})\). `mid_edge_top_completions_use_child_depth` asserts this scaling so completions stay consistent with `estimate()`.
+- **Merge = sum then truncate.** Heavy-hitter summaries merge by adding shared suffixes and re-truncating to capacity, keeping results order-invariant (`top_k_compactor_merge_is_order_invariant`). Expect small divergences from strict Misra-Gries guarantees; GPS intentionally prioritizes “keep the heaviest suffixes we saw” behavior.
 
 ### Merge (distributed)
 
@@ -124,13 +143,15 @@ When the tries are compressed, merging also has to respect **edge boundaries**:
 1. For every incoming compressed edge, find the destination edge that shares the same first byte.
 2. Walk down while the labels match. If they match exactly, add `mid_sums` elementwise and recurse into the child.
 3. If the match ends mid-label (partial overlap), **split** the destination edge at the longest common prefix. Add overlapping `mid_sums` for the shared interior buckets.
-4. Move the overlapping boundary accumulator (`mid_sums[lcp-1]`) into the child node’s `S` before recursing so that the promoted node stores the correct raw mass.
+4. **Add** (do not rescale) the overlapping boundary accumulator (`mid_sums[lcp-1]`) into the child node’s `S` before recursing so that the promoted node stores the correct raw mass.
 
 This keeps the trie canonical and preserves unbiased estimates even when merges introduce new branching points along a compressed edge.
 
 No global coordination is required beyond agreeing on `(\alpha,\text{seed}[,\text{hh capacity}])`. Remember the crate’s default constructor randomizes the seed; call `with_seed`/`with_heavy_hitters` when you intend to merge shards.
 
-> **Promotion caveat:** if you “promote” select prefixes to exact maintenance (forcing \(q=1\) for them), keep that list deterministic and shared across shards; otherwise merges could introduce bias.
+`merge_boundary_mid_carries_overlap` exercises the entire split/add path to ensure merges transfer boundary mass exactly once.
+
+> **Promotion caveat / future work:** the shipped crate only implements **structural promotion** (unit-byte nodes up to `PROMOTION_DEPTH`). Per-node “exact maintenance” (forcing \(q=1\) for specific prefixes) remains future work. If or when you add it, the promotion policy must be deterministic and shared across shards to avoid bias.
 
 ---
 
@@ -159,6 +180,10 @@ Every realized prefix lives either on a node (`S`) or inside an edge (`mid_sums[
 * **Arena allocation** for node/edge storage.
 * **Children**: for byte alphabets, a tiny 256-bit bitmap + packed child array is fast; for UTF-8 or general alphabets, a sorted small vector (binary search) is usually fine.
 
+**Hybrid trie (unit-byte promotion + compression).** Depths `0..PROMOTION_DEPTH` (the Rust crate fixes `PROMOTION_DEPTH = 4`) are stored as **unit-byte nodes** so every character has its own node. That keeps shallow prefixes exact and simplifies merges. Beyond that depth the trie switches to **compressed edges** with `mid_sums`, drastically shrinking memory for long suffixes. This is the only form of “promotion” implemented today—it’s **structural**, not a “set q(ℓ) = 1” toggle.
+
+> Exact-maintenance (q=1) promotion is **future work**. Any design that maintains per-node q=1 must share the promotion set across shards; the current crate does not ship this feature and always uses the geometric sampler for every node beyond the structural promotion depth.
+
 ### Sampling function (branchless, (\alpha=1/2))
 
 We hash every key with XXH3-128 (keyed) and count leading zeros across the full
@@ -184,9 +209,9 @@ For general (\alpha), either map a uniform (u) via (\lfloor \log(u) / \log(\alph
 
 ### Depth caps & zeroed tails
 
-* **α = 0.5 (fast path):** Counting leading zeros across 128 hash bits yields at most 128 zeros, so the realizable depth is \(L \le 129\). Any sampled depth beyond that is clamped to 129, and the sampler also caps by the key length.
-* **General α:** The inclusion table stores `q(ℓ)` up to a configurable bound (200 000 entries in the reference implementation) and defines `q(ℓ) = 0` beyond that. Insertions therefore clamp `L` to `min(|key|, max_realizable_depth)`.
-* **Queries:** Because `q(depth)=0` past the realizable cap, estimates deeper than the table deterministically return 0. This keeps memory bounded for high-α sketches while making the specification explicit about how “too-deep” prefixes behave.
+* **α = 0.5 (fast path):** Counting leading zeros across 128 hash bits yields at most 128 zeros, so the realizable depth is \(L \le 129\). Any sampled depth beyond that is clamped to 129, and the sampler also caps by the key length. Depth‑1 remains exact for every α; `depth_one_counts_are_exact_for_general_alpha` locks this in the test suite.
+* **General α:** The inclusion table stores `q(ℓ)` for exactly **200 000** entries in the reference crate and defines `q(ℓ) = 0` beyond that. Insertions clamp `L` to `min(|key|, table_len, depth_cap)` so high-α configurations cannot allocate unbounded tables.
+* **Queries:** Because `q(depth)=0` past the realizable cap, estimates deeper than the table deterministically return 0. `unreachable_depth_estimates_to_zero` exercises this specification so applications are never surprised by a silent underflow.
 
 ### Insert pseudocode
 
@@ -300,10 +325,7 @@ function estimate_prefix_sum(prefix, α=0.5):
 
 ## Limitations (and how to mitigate)
 
-* **Unbounded variance for very deep, very small prefixes.** True: when (N_P) is tiny and (\ell) large, relative error can be high. Mitigate by:
-
-  * Raising (\alpha) (spend more CPU), or
-  * **On‑demand promotion:** if a prefix is frequently queried, start *exactly* maintaining that node: on future updates, always touch it (set (q(\ell)=1) for that specific node).
+* **Unbounded variance for very deep, very small prefixes.** True: when (N_P) is tiny and (\ell) large, relative error can be high. Mitigate by raising (\alpha) (spend more CPU) or by building a secondary exact cache for the hottest prefixes. The previously sketched **“set \(q(\ell)=1\) for this node” promotion** is not implemented in this crate yet; keep it as future work unless every shard can deterministically agree on the promoted set.
 * **Repeated keys inflate variance under per‑key sampling.** When the same key appears many times, all of its occurrences are either sampled or not together, so variance scales with \(\sum_s w_s^2\). Mitigate by bumping \(\alpha\), promoting hot prefixes, or (if you have a stable per‑event identifier) hashing on `(key, event_id)` to get per‑occurrence sampling.
 * **Counts only (sums of nonnegative values).** For signed updates (turnstile with cancellations), the estimator remains unbiased, but variance adds; use wider counters or float.
 * **Insertion-only heavy hitters.** The default HH compactor never subtracts weight when you apply negative deltas. After deletions, its reported weights can lag the unbiased `estimate(P)` values. If this matters, either disable HH summaries or replace them with a signed sketch (e.g., SpaceSaving with explicit decrements).
@@ -336,13 +358,13 @@ q(depth) =
 
 function sample_level(hash128 h, α):
     if α == 0.5:
-        L = 1 + clz128(h)
+        L = 1 + clz128(h)             // capped at 129 via MAX_DEPTH
     else:
-        // Convert to uniform u in (0,1)
-        u = (h + 1) / 2^128
-        // Geometric tail: floor( ln(u)/ln(α) ) + 1
-        L = 1 + floor(log(u) / log(α))
-    return min(MAX_DEPTH, max(1, L))
+        // Precompute q128[d] = floor(α^(d-1) * 2^128) for d ≤ MAX_DEPTH
+        L = 1
+        while L < MAX_DEPTH and h < q128[L+1]:
+            L += 1
+    return L
 
 function add(key s, Δ):
     h = Hash128(s)
