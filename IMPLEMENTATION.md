@@ -23,7 +23,7 @@ public API surface minimal.
 | Geometric depth sampling (Horvitz–Thompson rescaling) | ✅ Implemented. | `GpsSketch::add` turns the XXH3-128 hash into a Q128 integer. For `α = 0.5` we take `1 + clz128(h)` (clamped at 129); for every other `α` we walk a precomputed table of fixed-point thresholds (`q128[d] = ⌊α^{d-1} · 2^128⌋`) up to 200 000 entries. Depths beyond that return `q = 0`, so queries deterministically return 0 rather than underflow. 
 | Deterministic hashing | ✅ Implemented. | `util::deterministic_hash` uses `xxh3_128_with_seed` so shards merge safely. `GpsSketch::default()` now sources a secure random seed; use `with_seed(alpha, seed)` when deterministic merging is required.
 | Constructors & seeding semantics | ✅ Implemented. | `GpsSketch::default()` → random seed (best for adversarial keys), `GpsSketch::with_seed(alpha, seed)` → explicit seed for shard merges, `GpsSketch::new(alpha)` → fixed seed `0` for legacy deterministic behavior. `with_heavy_hitters` forwards whichever seed you choose.
-| Hybrid trie (unit-byte + compressed edges) | ✅ Implemented (see `tree.rs`). | Depths 0–4 are unit-byte nodes for exact shallow prefixes; deeper segments compress into single edges with `mid_sums`. This is structural promotion only (no per-node `q=1`).
+| Hybrid trie (unit-byte promotion + compression) | ✅ Implemented (see `tree.rs`). | Depths 0–4 use unit-byte nodes for exact shallow prefixes; deeper paths compress into single edges with `mid_sums`. This is structural promotion only—not per-node `q=1` promotion.
 | Heavy-hitter sketches per node | ✅ Optional. | A truncate-to-capacity top-k compactor stores the heaviest suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates and merges summaries by summing shared suffixes then truncating back to capacity. Only positive deltas feed the HH stream so completions never inherit negative mass.
 | Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. Heavy hitters reuse the same sum-then-truncate compactor merge so results are order-invariant. Callers must still match `alpha`, `hash_seed`, and HH capacity (the code `assert!`s every merge).
 | Pruning low-signal prefixes | ✅ `prune_by_estimate`. | Recurses through the trie, comparing the unbiased magnitude `|S / q(depth)|` (nodes + mid-edge buckets) against the threshold before deleting subtrees.
@@ -44,7 +44,7 @@ public API surface minimal.
 - **Alternate alphabets / arenas:** the trie stores `Vec<u8>` for edge labels and allocates per insertion. Switching to arenas or slices would reduce fragmentation but adds complexity.
 - **Advanced heavy-hitter logic (e.g., Count-Min per node):** the current truncate-to-`k` compactor is simple but sufficient for small `k`.
 - **Per-node exact maintenance (`q=1`) promotions:** highlighted in DESIGN.md as future work; the current crate only applies the structural promotion depth (unit-byte nodes through `PROMOTION_DEPTH`).
-- **Per-occurrence sampling mode:** not implemented. Every key hashes once, so adding per-event randomness (e.g., hashing `(key, event_id)`) is future work.
+- **Per-occurrence sampling mode:** not implemented. The crate hashes `(key, seed)` once per distinct key; adopting per-event randomness (e.g., hashing `(key, event_id)`) remains future work.
 - **Numerical safeguards near the depth cap:** the inclusion table already zeroes probabilities once they fall below the 128-bit fixed-point threshold, so high-depth queries deterministically return 0. Future work would explore log-space or higher-precision tables instead of the present “set `q=0` beyond the cap” rule.
 
 ## Justifications / trade-offs
@@ -149,16 +149,16 @@ workload.
 
 ### Root and iteration guarantees
 
-- The depth-0 root prefix is always materialized with `q(0) = 1`, so `GpsSketch::total()` returns the exact sum of all applied deltas.
-- `iter_estimates()` walks both explicit nodes and mid-edge buckets, scaling each by \(1/q(depth)\). Tests `iter_estimates_reports_mid_edge_prefixes` and `iter_estimates_match_raw_traversal` cement this guarantee.
+- The depth-0 root prefix is always materialized with `q(0)=1`, so `GpsSketch::total()` is an exact sum of all deltas.
+- `iter_estimates()` enumerates **both** node prefixes and **mid-edge** buckets, applying the same \(1/q(\text{depth})\) scaling. The tests `iter_estimates_reports_mid_edge_prefixes` and `iter_estimates_match_raw_traversal` verify this behavior.
 
 ### Depth caps & unreachable depths
 
 - `α = 0.5` ⇒ `1 + clz128` so realizable depths top out at **129**. Depth-1 is always exact regardless of α; see `depth_one_counts_are_exact_for_general_alpha`.
-- General `α` uses the same sampler but clamps to the 200 000-entry inclusion table. Beyond that, `q(depth) = 0` by construction, so inserts never touch deeper prefixes.
+- General `α` uses the same sampler but clamps to an inclusion table of **up to 200 000 entries**. Beyond that, `q(depth) = 0` by construction, so inserts never touch deeper prefixes.
 - Queries follow the same rule: if `q(depth) = 0`, we return 0 immediately instead of risking floating-point underflow. The regression `unreachable_depth_estimates_to_zero` verifies this behavior.
 
-> Constants live in `src/util.rs`: `HALF_MAX_DEPTH = 129` for the α = 0.5 fast path and `MAX_TABLE_DEPTH = 200_000` for the general-α inclusion table.
+> Code constants: `HALF_MAX_DEPTH = 129` (α = 0.5 fast path) and `MAX_TABLE_DEPTH = 200_000` (general α cap) in `src/util.rs`.
 
 ### Heavy-hitter caveats (current behavior)
 
@@ -194,7 +194,7 @@ new enough to enable that edition before running builds or tests.
 3. Alternative heavy-hitter sketches (Count-Min, etc.) plug-ins.
 4. Streaming/backpressure interface for pruning/compaction.
 5. Extended sampler that chains additional deterministic blocks when all 128 bits are zero, removing the 129-depth ceiling for `α = 0.5`.
-6. Coordinated per-occurrence sampling and deterministic per-prefix `q=1` promotion policies once shard negotiation is specified.
+6. Per-occurrence sampling and deterministic q=1 promotion once shard coordination design is finalized.
 
 For now, this implementation matches the majority of DESIGN.md’s promises and
 keeps the public API ergonomic for application developers.

@@ -184,7 +184,7 @@ Every realized prefix lives either on a node (`S`) or inside an edge (`mid_sums[
 
 > Exact-maintenance (q=1) promotion is **future work**. Any design that maintains per-node q=1 must share the promotion set across shards; the current crate does not ship this feature and always uses the geometric sampler for every node beyond the structural promotion depth.
 
-### Sampling function (branchless, (\alpha=1/2))
+### Sampling function (α=0.5 fast path; general-α threshold table)
 
 We hash every key with XXH3-128 (keyed) and count leading zeros across the full
 128 bits:
@@ -205,12 +205,12 @@ from other shards or higher α to get sampled mass.
 > so the geometric tail never truncates. We have not implemented that yet; it's
 > listed as future work so this document stays honest about the current cap.
 
-For general (\alpha), either map a uniform (u) via (\lfloor \log(u) / \log(\alpha)\rfloor + 1) or use a tiny lookup table for (q(\ell)=\alpha^{\ell-1}) to avoid `log`.
+For general (α), use the same keyed 128-bit hash as a Q128 integer and advance through a precomputed monotone threshold array `q128[d] ≈ ⌊α^{d-1} · 2^128⌋`, stopping at the first depth where `hash ≥ q128[d+1]`. This yields deterministic, platform-stable sampling without floating point.
 
 ### Depth caps & zeroed tails
 
 * **α = 0.5 (fast path):** Counting leading zeros across 128 hash bits yields at most 128 zeros, so the realizable depth is \(L \le 129\). Any sampled depth beyond that is clamped to 129, and the sampler also caps by the key length. Depth‑1 remains exact for every α; `depth_one_counts_are_exact_for_general_alpha` locks this in the test suite.
-* **General α:** The inclusion table stores `q(ℓ)` for exactly **200 000** entries in the reference crate and defines `q(ℓ) = 0` beyond that. Insertions clamp `L` to `min(|key|, table_len, depth_cap)` so high-α configurations cannot allocate unbounded tables.
+* **General α:** The inclusion table stores `q(ℓ)` for **up to 200 000** entries (capped) in the reference crate and defines `q(ℓ) = 0` beyond that. Insertions clamp `L` to `min(|key|, table_len, depth_cap)` so high-α configurations cannot allocate unbounded tables.
 * **Queries:** Because `q(depth)=0` past the realizable cap, estimates deeper than the table deterministically return 0. `unreachable_depth_estimates_to_zero` exercises this specification so applications are never surprised by a silent underflow.
 
 ### Insert pseudocode
@@ -367,8 +367,7 @@ function sample_level(hash128 h, α):
     return L
 
 function add(key s, Δ):
-    // Hybrid trie: depths < PROMOTION_DEPTH (4) stay unit-byte nodes,
-    // beyond that we traverse compressed edges with mid_sums.
+    // Hybrid trie: single-byte nodes for depths < PROMOTION_DEPTH (4), then compressed edges with `mid_sums`
     h = Hash128(s)
     L = min(sample_level(h, α), |s|)
     node = root
