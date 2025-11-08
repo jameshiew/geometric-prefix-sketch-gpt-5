@@ -7,7 +7,7 @@ pub(crate) const PROMOTION_DEPTH: usize = 4;
 #[derive(Clone, Debug)]
 pub(crate) struct Node {
     pub(crate) sum: f64,
-    pub(crate) heavy: Option<MisraGries>,
+    pub(crate) heavy: Option<TopKCompactor>,
     pub(crate) children: Vec<Edge>,
 }
 
@@ -15,7 +15,7 @@ impl Node {
     pub(crate) fn new(heavy_capacity: Option<usize>) -> Self {
         Self {
             sum: 0.0,
-            heavy: heavy_capacity.map(MisraGries::new),
+            heavy: heavy_capacity.map(TopKCompactor::new),
             children: Vec::new(),
         }
     }
@@ -133,7 +133,7 @@ impl Edge {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct MisraGries {
+pub(crate) struct TopKCompactor {
     capacity: usize,
     entries: Vec<HeavyEntry>,
     index: HashMap<Vec<u8>, usize>,
@@ -145,7 +145,7 @@ struct HeavyEntry {
     weight: f64,
 }
 
-impl MisraGries {
+impl TopKCompactor {
     pub(crate) fn new(capacity: usize) -> Self {
         assert!(capacity > 0);
         Self {
@@ -210,7 +210,7 @@ impl MisraGries {
         }
     }
 
-    pub(crate) fn merge_from(&mut self, other: &MisraGries) {
+    pub(crate) fn merge_from(&mut self, other: &TopKCompactor) {
         for (key, weight) in other.iter_entries() {
             if let Some(&idx) = self.index.get(key) {
                 self.entries[idx].weight += weight;
@@ -462,7 +462,7 @@ pub(crate) fn merge_nodes(dst: &mut Node, src: &Node, heavy_capacity: Option<usi
         (Some(dst_hh), Some(src_hh)) => dst_hh.merge_from(src_hh),
         (None, Some(src_hh)) => {
             if let Some(cap) = heavy_capacity {
-                let mut hh = MisraGries::new(cap);
+                let mut hh = TopKCompactor::new(cap);
                 hh.merge_from(src_hh);
                 dst.heavy = Some(hh);
             }
@@ -688,8 +688,8 @@ mod tests {
     }
 
     #[test]
-    fn misra_gries_defers_compression_until_double_capacity() {
-        let mut sketch = MisraGries::new(2);
+    fn top_k_compactor_defers_compression_until_double_capacity() {
+        let mut sketch = TopKCompactor::new(2);
         sketch.update(b"a", 1.0);
         sketch.update(b"b", 1.0);
         sketch.update(b"c", 1.0);
@@ -699,9 +699,9 @@ mod tests {
     }
 
     #[test]
-    fn misra_gries_merge_delays_compression() {
-        let mut left = MisraGries::new(4);
-        let mut right = MisraGries::new(4);
+    fn top_k_compactor_merge_delays_compression() {
+        let mut left = TopKCompactor::new(4);
+        let mut right = TopKCompactor::new(4);
         for i in 0..4 {
             let key = vec![b'a', i as u8];
             left.update(&key, 1.0);
@@ -717,9 +717,9 @@ mod tests {
     }
 
     #[test]
-    fn misra_gries_merge_caps_capacity() {
-        let mut left = MisraGries::new(32);
-        let mut right = MisraGries::new(32);
+    fn top_k_compactor_merge_caps_capacity() {
+        let mut left = TopKCompactor::new(32);
+        let mut right = TopKCompactor::new(32);
         for i in 0..64 {
             let key = vec![b'a', i as u8];
             left.update(&key, 1.0 + i as f64);

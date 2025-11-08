@@ -30,7 +30,7 @@ Consider keys as strings over an alphabet (bytes, UTF‑8 code units, bits for i
 Each realized trie node `P` stores:
 
 * `S(P)`: a **sampled (unscaled)** accumulator for the sum/count under prefix `P`. We add `Δ` to `S(P)` whenever `P` is visited; the unbiased estimate divides by the inclusion probability \(q(|P|)\) at query time.
-* (Optional) a tiny **heavy‑hitter sketch** (e.g., Misra-Gries or a 3–4 row Count‑Min) to extract frequent *extensions* under `P` for autocomplete. This sketch only sees the Bernoulli subsample induced by depth `|P|`.
+* (Optional) a tiny **heavy‑hitter summary** implemented as a bounded top‑k compactor (think “keep the `k` heaviest suffixes seen so far”). It merges by summing shared keys and re‑truncating to capacity, and it only sees the Bernoulli subsample induced by depth `|P|`. It is **not** a strict Misra‑Gries guarantee; if you need deterministically bounded error, swap in an actual MG/SpaceSaving variant.
 * Child pointers (we recommend a **compressed trie**/radix node to pack runs of characters).
 
 We fix a geometric parameter `α ∈ (0,1)` that tunes cost vs. accuracy (think `α = 1/2` by default).
@@ -66,7 +66,7 @@ Adds value `Δ` (often 1 for counting). Let `s` be the key, length `|s|`.
 
    * Update the **sampled** sum:
      `S(P) += Δ`  (we store the raw sampled total and scale only at query time)
-   * (Optional) Update `P`’s heavy‑hitter sketch with the **remaining suffix** (or the full key), weight `Δ`. The sketch therefore tracks a Bernoulli subsample at this depth; multiply reported weights by \(1/q(|P|)\) when displaying. If the sketch is **nonlinear** (Misra‑Gries/SpaceSaving), consider inserting weight \(Δ/q(|P|)\) so its internal thresholds mirror the unbiased totals; linear sketches (Count‑Min, CountSketch) can safely stay unscaled until query time.
+   * (Optional) Update `P`’s top‑k compactor with the **remaining suffix** (or the full key), weight `Δ`. The summary therefore tracks a Bernoulli subsample at this depth; multiply reported weights by \(1/q(|P|)\) when displaying. Because the compactor is nonlinear (truncate-to-capacity), we simply add sampled weights and scale on readback; it does **not** inherit Misra‑Gries frequency guarantees, only “keep the heaviest things we saw.”
 
 **Why is this unbiased?**
 For any fixed prefix (P) of length (\ell), a key under (P) contributes to `S(P)` **iff** (L \ge \ell), which happens with probability (q(\ell)=\alpha^{\ell-1}). If we define the estimated sum at query time as ( \widehat{A}(P) = S(P)/q(\ell) ), then for each key with contribution (\Delta),
@@ -111,7 +111,7 @@ Because (q(1)=1) for any (\alpha), depth‑1 totals are always exact. Raising (\
 
 At node `P`, query the local heavy‑hitter sketch (updated only when `P` was touched, i.e., with probability (q(|P|)) per key). The sketch naturally tracks frequent **completions** under `P`. You can scale counts by (1/q(|P|)) to unbias.
 
-> Note: Misra‑Gries/SpaceSaving are **nonlinear**. Scaling their reported weights by \(1/q(|P|)\) adjusts magnitudes but does not make the top‑k set itself unbiased. In practice, heavy items stay heavy under Bernoulli subsampling, and these sketches remain mergeable (standard Misra‑Gries merge = sum then compress).
+> Note: The bounded top‑k compactor is **nonlinear**. Scaling its reported weights by \(1/q(|P|)\) adjusts magnitudes but does not make the top‑k set itself unbiased. In practice, heavy items stay heavy under Bernoulli subsampling, and the compactor remains mergeable because we simply add shared suffixes and truncate back to capacity.
 
 ### Merge (distributed)
 
@@ -137,7 +137,7 @@ struct Node {
   string edge_label;        // compressed run (could be slice into an arena)
   double S;                 // sampled (unscaled) sum; int64 works if counts only
   Children children;        // sorted small vector or array-mapped (HAMT-like)
-  Optional<HHSketch> hh;    // tiny Misra-Gries or CM-Sketch (optional)
+  Optional<HHSketch> hh;    // tiny bounded top-k compactor (optional)
 }
 ```
 
@@ -146,29 +146,24 @@ struct Node {
 
 ### Sampling function (branchless, (\alpha=1/2))
 
-```c
-uint64_t h = splitmix64(key_bytes);
-int L = 1 + clz(h);   // number of leading zeros until the first 1 bit
-L = min(L, key_length);
-```
-
-(Or use standard “position of first 1” trick; any deterministic geometric sampler works.)
-
-> **Avoiding the 64‑bit cap.** `1 + clz(h)` caps \(L\) at 65, so extremely long strings would never sample deeper. To keep the full geometric tail, stream additional deterministic blocks (e.g., from a keyed XOF/PRF seeded by the key) and continue counting leading zeros until you encounter a 1‑bit:
+We hash every key with XXH3-128 (keyed) and count leading zeros across the full
+128 bits:
 
 ```c
-int sample_level_extended(Key key) {
-    XofStream xs = keyed_xof(key, seed);
-    int L = 1;
-    for (;;) {
-        uint64_t block = xs.next_u64();
-        int z = clz(block);
-        L += z;
-        if (z < 64) break;
-    }
-    return L;
-}
+uint128_t h = xxh3_128(key_bytes, seed);
+int L = 1 + clz128(h);   // number of leading zeros until the first 1 bit
+L = min(L, key_length, 129);  // 128 bits ⇒ max realizable depth 129
 ```
+
+This exactly matches the implementation: the sampler can realize depths 1‥=129
+when `α = 0.5`, and anything deeper is treated as depth 129. Longer prefixes are
+still stored (the trie can grow arbitrarily deep) but they rely on observations
+from other shards or higher α to get sampled mass.
+
+> **Extended sampler (future work).** Earlier drafts suggested streaming extra
+> deterministic blocks (e.g., from a keyed XOF) whenever all 128 bits are zero
+> so the geometric tail never truncates. We have not implemented that yet; it's
+> listed as future work so this document stays honest about the current cap.
 
 For general (\alpha), either map a uniform (u) via (\lfloor \log(u) / \log(\alpha)\rfloor + 1) or use a tiny lookup table for (q(\ell)=\alpha^{\ell-1}) to avoid `log`.
 
@@ -205,6 +200,8 @@ function estimate_prefix_sum(prefix, α=0.5):
 
 > **Note on scaling:** We store `S(P)` as the raw sampled total (ints or f64). At query time we divide by \(q(|P|)\). If you need integer‑only outputs, precompute reciprocals (or fixed‑point factors) per depth and apply them on read.
 
+> **Depth cap trade-off:** For (α \to 1) the inclusion table would otherwise grow without bound, so we cap the realizable depth at 200 000 entries. Any depth beyond that is defined to have \(q = 0\) and therefore estimates to zero. This keeps memory bounded while allowing high-α sketches to function; it simply means “requested prefixes deeper than the table” behave as if they were never sampled.
+
 ---
 
 ## Why this works & what’s new
@@ -233,7 +230,7 @@ function estimate_prefix_sum(prefix, α=0.5):
 
    * Compressed radix trie + GPS logic.
    * Configurable `α`.
-   * Optional Misra-Gries sketch per node (capacity 8–16).
+   * Optional bounded top-k compactor per node (capacity 8–16).
 2. **Datasets:**
 
    * Public query logs (e.g., AOL 2006), Wikipedia page titles, real URL paths, synthetic Zipfian strings.
@@ -265,7 +262,9 @@ function estimate_prefix_sum(prefix, α=0.5):
 * **Parameter choice.** Start with (\alpha=0.5). If you need higher fidelity at deeper levels (e.g., 3–5 chars), try 0.6–0.7; watch update cost ((1/(1-\alpha))).
 * **Integer ranges.** Implement a bit‑trie front end: a 64‑bit unsigned splits naturally into 64 levels; GPS updates only a constant expected number of levels; range queries decompose into (\le 2\log U) prefixes—sum their estimates.
 * **Bias/variance tuning.** You can make depth‑dependent (\alpha_\ell) (e.g., slower decay beyond depth 4) by reading more bits from the hash to sample from a *piecewise geometric* distribution; same analysis applies with (q(\ell)=\Pr[L\ge\ell]).
-* **Heavy hitters.** Misra-Gries with capacity 8–16 per node gives good top-k completions; scale estimates by (1/q(|P|)). These sketches are nonlinear, so scaling fixes magnitudes but not the set itself—good enough because heavy items stay heavy under the subsample.
+* **Heavy hitters.** A truncate-to-capacity top-k compactor with capacity 8–16 per node gives good completions; scale estimates by \(1/q(|P|)\). The summary is nonlinear, so scaling fixes magnitudes but not the set itself—good enough because heavy items stay heavy under the subsample. If you need deterministic frequency guarantees, plug in a true Misra-Gries or SpaceSaving variant.
+
+*Mid-edge HH behavior.* When a query prefix ends in the middle of a compressed edge, we first append the remaining edge label so we can consult the downstream node’s summary. Only the suffixes observed at that child participate—updates that stopped exactly at the mid-edge accumulator never enter that HH summary—so the completions you see are always of the form `prefix + remaining_edge + hh_suffix`.
 * **Promotion policy.** If you “promote” certain prefixes to exact maintenance (force \(q=1\)), keep the policy deterministic and shared across shards so merges stay unbiased.
 * **Persistence.** Because decisions are hash‑deterministic, you can **replay** updates idempotently and snapshot/restore cheaply.
 * **Concurrency.** Shard by first byte/edge; merge node‑local counters with lock‑free atomics; the per‑node work is tiny.

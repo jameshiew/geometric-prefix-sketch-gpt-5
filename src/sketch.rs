@@ -7,11 +7,11 @@
 //! past a configurable promotion depth occupy a single node/edge instead of one
 //! heap allocation per byte.
 
-#[cfg(test)]
-use crate::tree::{MisraGries, PROMOTION_DEPTH, ensure_edge, visit_raw};
 use crate::tree::{
     Node, PrefixMatch, add_inner, locate_prefix, locate_raw_sum, merge_nodes, prune_node,
 };
+#[cfg(test)]
+use crate::tree::{PROMOTION_DEPTH, TopKCompactor, ensure_edge, visit_raw};
 #[cfg(test)]
 use crate::util::inclusion_prob;
 use crate::util::{InclusionTable, deterministic_hash};
@@ -57,7 +57,7 @@ impl GpsSketch {
 
     /// Creates a sketch with per-node heavy-hitter capacity.
     ///
-    /// Heavy hitters are tracked via a Misra-Gries-style summary stored on each
+    /// Heavy hitters are tracked via a bounded top-k compactor stored on each
     /// visited prefix node. Only **positive** updates contribute to the heavy
     /// hitter stream.
     pub fn with_heavy_hitters(alpha: f64, hash_seed: u64, hh_capacity: usize) -> Self {
@@ -462,7 +462,7 @@ mod tests {
 
     fn zero_out_tree(node: &mut Node, heavy_capacity: Option<usize>) {
         node.sum = 0.0;
-        node.heavy = heavy_capacity.map(MisraGries::new);
+        node.heavy = heavy_capacity.map(TopKCompactor::new);
         for edge in &mut node.children {
             for raw in &mut edge.mid_sums {
                 *raw = 0.0;
@@ -939,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn misra_gries_merge_is_order_invariant() {
+    fn top_k_compactor_merge_is_order_invariant() {
         let mut a = GpsSketch::with_heavy_hitters(0.5, 0, 4);
         let mut b = GpsSketch::with_heavy_hitters(0.5, 0, 4);
         for _ in 0..100 {

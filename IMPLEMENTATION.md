@@ -9,7 +9,7 @@ The crate exposes a single public type, [`GpsSketch`](src/sketch.rs), layered on
 three modules:
 
 - `util`: deterministic hashing (XXH3) and inclusion-probability helpers.
-- `tree`: compressed radix trie (nodes, edges, heavy-hitter Misra-Gries summaries, merge
+- `tree`: compressed radix trie (nodes, edges, heavy-hitter top-k compactor summaries, merge
   helpers). Most data-structure heavy lifting lives here.
 - `sketch`: user-facing API, sampling, deterministic merge wiring, and tests.
 
@@ -20,11 +20,11 @@ public API surface minimal.
 
 | DESIGN element | Status | Notes |
 | -------------- | ------ | ----- |
-| Geometric depth sampling (Horvitz–Thompson rescaling) | ✅ Implemented. | `GpsSketch::add` samples a max depth using XXH3-derived uniform bits and `sample_level_for_hash`; queries rescale by `alpha^(depth-1)`.
+| Geometric depth sampling (Horvitz–Thompson rescaling) | ✅ Implemented. | `GpsSketch::add` samples a max depth using XXH3-128 leading-zero counts (`α=0.5` realizable depths stop at 129) and, for general `α`, a precomputed inclusion table capped at 200 000 entries where deeper levels are defined to have `q=0`; queries rescale by `alpha^(depth-1)`.
 | Deterministic hashing | ✅ Implemented. | `util::deterministic_hash` uses `xxh3_128_with_seed` so shards merge safely.
 | Compressed radix trie with mid-edge mass | ✅ Implemented (see `tree.rs`). | Nodes hold `sum` plus edges with `label` and `mid_sums`. Node promotion depth currently hard-coded at 4 (`PROMOTION_DEPTH`).
-| Heavy-hitter sketches per node | ✅ Optional. | A Misra-Gries summary stores top suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates and merges summaries via `MisraGries::merge_from`. Only positive deltas feed the HH stream so completions never inherit negative mass.
-| Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. Heavy hitters reuse the Misra-Gries merge so results are order-invariant. Callers must still match `alpha`, `hash_seed`, and HH capacity (the code `assert!`s every merge).
+| Heavy-hitter sketches per node | ✅ Optional. | A truncate-to-capacity top-k compactor stores the heaviest suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates and merges summaries by summing shared suffixes then truncating back to capacity. Only positive deltas feed the HH stream so completions never inherit negative mass.
+| Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. Heavy hitters reuse the same sum-then-truncate compactor merge so results are order-invariant. Callers must still match `alpha`, `hash_seed`, and HH capacity (the code `assert!`s every merge).
 | Pruning low-signal prefixes | ✅ `prune_by_estimate`. | Recurses through the trie, dropping subtrees once their scaled estimate falls below threshold.
 | Examples/benchmarks | ✅ `examples/` + Criterion benches. | Provide runnable demos and performance harnesses.
 | Accuracy/integration testing | ✅ `tests/accuracy.rs`. | Ensures estimates align with exact counts on random data (with a tolerance for deep prefixes).
@@ -33,8 +33,8 @@ public API surface minimal.
 
 - **Configurable promotion depth:** currently a constant (`PROMOTION_DEPTH = 4`). DESIGN.md suggests adapting it; this is future work.
 - **Alternate alphabets / arenas:** the trie stores `Vec<u8>` for edge labels and allocates per insertion. Switching to arenas or slices would reduce fragmentation but adds complexity.
-- **Advanced heavy-hitter logic (e.g., Count-Min per node):** the current Misra-Gries summary is simple but sufficient for small `k`.
-- **Precision safeguards:** for very deep prefixes (depth > ~40) the inclusion probability underflows toward `f64::MIN_POSITIVE`. DESIGN.md hints at using arbitrary precision or per-depth scaling tables; presently we clamp to `MIN_POSITIVE`, which inflates variance but keeps numbers finite.
+- **Advanced heavy-hitter logic (e.g., Count-Min per node):** the current truncate-to-`k` compactor is simple but sufficient for small `k`.
+- **Precision safeguards:** for very deep prefixes (depth > ~40) the inclusion probability underflows toward `f64::MIN_POSITIVE`. DESIGN.md hints at using arbitrary precision or per-depth scaling tables; presently we clamp to `MIN_POSITIVE`, which inflates variance but keeps numbers finite, and we cap the precomputed inclusion table at 200 000 depths so high-`α` sketches cannot allocate unbounded memory (deeper levels are treated as `q = 0`).
 
 ## Justifications / trade-offs
 
@@ -63,21 +63,27 @@ is the intended entry point for that configuration.
 
 Sampling now mirrors the design’s deterministic story exactly:
 
-- For `α = 0.5` (the default), `sample_level_for_hash` uses just the
+- For `α = 0.5` (the default), `sample_level_for_hash` uses the
   number of leading zeros in the 128-bit hash (`1 + clz(hash)`), capped by the
-  key length. No floating point math, no branches.
+  key length and by the 128-bit limit (max realizable depth = 129). No floating
+  point math, no branches. Extending beyond 129 via a streamed “extended
+  sampler” is still on the future-work list.
 - For general `α`, we precompute a monotone table of Q128 thresholds derived
   from `α^(ℓ-1)` so runtime sampling boils down to comparing `hash < q128[ℓ]`
-  with zero floating-point work. Every shard therefore makes identical
-  keep/drop decisions without depending on platform rounding quirks.
+  with zero floating-point work. The table itself is capped at 200 000 depths to
+  keep memory bounded when `α → 1`; deeper levels are defined to have `q = 0`.
+  Every shard therefore makes identical keep/drop decisions without depending on
+  platform rounding quirks.
 
-### 3. Misra-Gries index map & merges
+### 3. Top-k compactor bookkeeping & merges
 Original DESIGN only said “tiny heavy-hitter sketch”. Instead of a multi-row
-Count-Min, we use a Misra-Gries summary with an auxiliary `HashMap` to keep
-updates `O(1)` despite storing arbitrary byte suffixes. During shard merges we
-call `MisraGries::merge_from`, which sums shared counters then performs the
-Frequent-algorithm “compress” step to restore capacity, so merge order can’t
-perturb the heavy-hitter winners.
+Count-Min, we keep a bounded top-k compactor backed by an auxiliary
+`HashMap<Vec<u8>, usize>` so updates stay `O(1)` even for arbitrary byte suffixes.
+Whenever the compactor grows to `2k` entries we select the `k` heaviest via
+`select_nth_unstable` and truncate. During shard merges we sum shared suffixes,
+append any new ones, then run the same truncate step, so merge order can’t
+perturb the heavy-hitter winners even though no strict Misra-Gries guarantees
+are claimed.
 
 ### 4. Merge strategy
 The first implementation replayed every prefix via `add_raw_sum`, which was
@@ -90,8 +96,8 @@ compressed-edge divergence correctly:
   before recursing into the remainder.
 - Children are cloned only when truly unique; otherwise we recurse into the
   shared node after rescaling the boundary accumulator.
-- Per-node heavy hitters are merged via `MisraGries::merge_from`, keeping the
-  HH summaries deterministic and order-invariant.
+- Per-node heavy hitters reuse the same sum-then-truncate compactor merge,
+  keeping the HH summaries deterministic and order-invariant.
 
 This keeps merge cost linear in the number of realized prefixes, guarantees the
 resulting trie stays compressed/canonical, and aligns with DESIGN.md’s “merge by
@@ -113,7 +119,7 @@ added `tests/accuracy.rs`, which:
   (`heavy_hitters_cover_mid_edge_prefixes`) so autocomplete doesn’t break when a
   prefix ends mid-edge.
 - Guards sampler determinism via `alpha_point_five_sampler_matches_leading_zeros`
-  and HH merge determinism via `misra_gries_merge_is_order_invariant`.
+  and HH merge determinism via `top_k_compactor_merge_is_order_invariant`.
 
 This ensures probabilistic behavior matches theory under a representative
 workload.
@@ -145,6 +151,7 @@ new enough to enable that edition before running builds or tests.
 2. More numerically stable inclusion probabilities (per-depth table).
 3. Alternative heavy-hitter sketches (Count-Min, etc.) plug-ins.
 4. Streaming/backpressure interface for pruning/compaction.
+5. Extended sampler that chains additional deterministic blocks when all 128 bits are zero, removing the 129-depth ceiling for `α = 0.5`.
 
 For now, this implementation matches the majority of DESIGN.md’s promises and
 keeps the public API ergonomic for application developers.
@@ -153,11 +160,12 @@ keeps the public API ergonomic for application developers.
 
 Users shouldn’t need to know whether a prefix stops at a node or mid-edge. The
 new `locate_prefix` helper lets `top_completions` stitch the remainder of a
-compressed edge onto the requested prefix before applying the Misra-Gries
-summary attached to the downstream node. Callers can now ask for completions of
-`"abcde"` even if the trie stores `"def"` as a single edge. Only completions
-observed at that downstream node are surfaced, so mid-edge HH output excludes
-speculative or pruned tails by construction.
+compressed edge onto the requested prefix before applying the downstream top-k
+compactor. Callers can now ask for completions of `"abcde"` even if the trie
+stores `"def"` as a single edge. Only suffixes observed at that child node are
+surfaced—updates that stopped exactly at the mid-edge accumulator never enter
+that compactor—so mid-edge HH output always has the form
+`prefix + remaining_edge + hh_suffix`.
 
 ### 8. Pointer safety in trie navigation
 
