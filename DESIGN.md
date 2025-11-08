@@ -367,6 +367,8 @@ function sample_level(hash128 h, α):
     return L
 
 function add(key s, Δ):
+    // Hybrid trie: depths < PROMOTION_DEPTH (4) stay unit-byte nodes,
+    // beyond that we traverse compressed edges with mid_sums.
     h = Hash128(s)
     L = min(sample_level(h, α), |s|)
     node = root

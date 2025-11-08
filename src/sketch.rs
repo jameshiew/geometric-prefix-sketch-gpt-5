@@ -288,7 +288,8 @@ impl GpsSketch {
         }
     }
 
-    /// Removes entire subtrees whose root estimate is below `min_abs_estimate`.
+    /// Removes entire subtrees whose **scaled** root estimate `|S / q(depth)|` falls
+    /// below `min_abs_estimate`.
     ///
     /// This is useful for reclaiming memory from low-signal prefixes while
     /// keeping the rest of the trie intact.
