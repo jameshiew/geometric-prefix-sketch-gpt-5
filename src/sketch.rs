@@ -15,6 +15,7 @@ use crate::tree::{PROMOTION_DEPTH, TopKCompactor, ensure_edge, visit_raw};
 #[cfg(test)]
 use crate::util::inclusion_prob;
 use crate::util::{InclusionTable, deterministic_hash};
+use std::fmt;
 
 /// Geometric Prefix Sketch with deterministic per-key sampling.
 ///
@@ -30,6 +31,41 @@ pub struct GpsSketch {
     heavy_capacity: Option<usize>,
     root: Node,
 }
+
+/// Error returned when attempting to merge sketches with incompatible configurations.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MergeError {
+    AlphaMismatch {
+        lhs: f64,
+        rhs: f64,
+    },
+    SeedMismatch {
+        lhs: u64,
+        rhs: u64,
+    },
+    HeavyCapacityMismatch {
+        lhs: Option<usize>,
+        rhs: Option<usize>,
+    },
+}
+
+impl fmt::Display for MergeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MergeError::AlphaMismatch { lhs, rhs } => {
+                write!(f, "alpha mismatch: {lhs} vs {rhs}")
+            }
+            MergeError::SeedMismatch { lhs, rhs } => {
+                write!(f, "hash seed mismatch: {lhs} vs {rhs}")
+            }
+            MergeError::HeavyCapacityMismatch { lhs, rhs } => {
+                write!(f, "heavy-hitter capacity mismatch: {lhs:?} vs {rhs:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MergeError {}
 
 impl Default for GpsSketch {
     fn default() -> Self {
@@ -59,7 +95,11 @@ impl GpsSketch {
     ///
     /// Heavy hitters are tracked via a bounded top-k compactor stored on each
     /// visited prefix node. Only **positive** updates contribute to the heavy
-    /// hitter stream.
+    /// hitter stream. **Warning:** because deletions (negative deltas) do not
+    /// modify the heavy-hitter summaries, [`top_completions`](Self::top_completions)
+    /// may report entries whose net weight has since shrunk or become negative
+    /// if you mix insertions with deletions. Prefer disabling heavy hitters or
+    /// modeling removals differently if you need signed semantics.
     pub fn with_heavy_hitters(alpha: f64, hash_seed: u64, hh_capacity: usize) -> Self {
         assert!(hh_capacity > 0);
         Self::with_heavy_hitters_internal(alpha, hash_seed, Some(hh_capacity))
@@ -178,7 +218,12 @@ impl GpsSketch {
     /// from the heavy-hitter output unless per-position HH sketches are
     /// enabled. Mid-edge completions therefore only include suffixes observed
     /// at the downstream node; pruned or unvisited tails are intentionally
-    /// absent. Returned strings always equal `prefix` plus any remaining edge
+    /// absent. **Warning:** heavy-hitter summaries treat the stream as
+    /// insertion-only—negative deltas update the total mass but do **not**
+    /// remove entries from these summaries. The reported top-k therefore
+    /// reflects the positive-only portion of the stream and may diverge from
+    /// [`estimate`](Self::estimate) when deletions cancel a previously heavy
+    /// key. Returned strings always equal `prefix` plus any remaining edge
     /// label (when the prefix ends mid-edge) plus the heavy-hitter suffix, and
     /// their weights are scaled using the inclusion probability at the summary
     /// depth of that downstream node.
@@ -237,24 +282,45 @@ impl GpsSketch {
         )
     }
 
-    /// Merges `other` into `self` by streaming raw sums from its trie.
+    /// Attempts to merge `other` into `self` by streaming raw sums from its trie.
     ///
     /// Both sketches must share the same [`alpha`](Self::alpha),
     /// [`hash_seed`](Self::hash_seed), and heavy-hitter capacity. The merge is
     /// linear in the number of prefixes realized by `other`.
+    pub fn try_merge_from(&mut self, other: &GpsSketch) -> Result<(), MergeError> {
+        if (self.alpha() - other.alpha()).abs() >= 1e-12 {
+            return Err(MergeError::AlphaMismatch {
+                lhs: self.alpha(),
+                rhs: other.alpha(),
+            });
+        }
+        if self.hash_seed != other.hash_seed {
+            return Err(MergeError::SeedMismatch {
+                lhs: self.hash_seed,
+                rhs: other.hash_seed,
+            });
+        }
+        if self.heavy_capacity != other.heavy_capacity {
+            return Err(MergeError::HeavyCapacityMismatch {
+                lhs: self.heavy_capacity,
+                rhs: other.heavy_capacity,
+            });
+        }
+        merge_nodes(&mut self.root, &other.root, self.heavy_capacity);
+        Ok(())
+    }
+
+    /// Merges `other` into `self`, panicking on configuration mismatches.
+    ///
+    /// Prefer [`try_merge_from`](Self::try_merge_from) in production code so
+    /// configuration mistakes can be handled gracefully.
     ///
     /// # Panics
     ///
     /// Panics if `alpha`, `hash_seed`, or heavy-hitter capacity differ because
     /// mismatched samplers would otherwise corrupt the estimates.
     pub fn merge_from(&mut self, other: &GpsSketch) {
-        assert!((self.alpha() - other.alpha()).abs() < 1e-12);
-        assert_eq!(self.hash_seed, other.hash_seed, "hash seed mismatch");
-        assert_eq!(
-            self.heavy_capacity, other.heavy_capacity,
-            "HH capacity mismatch"
-        );
-        merge_nodes(&mut self.root, &other.root, self.heavy_capacity);
+        self.try_merge_from(other).unwrap();
     }
 
     fn raw_sum(&self, prefix: &[u8]) -> Option<(f64, usize)> {
@@ -1038,18 +1104,49 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "hash seed mismatch")]
-    fn merge_requires_matching_seeds() {
+    fn try_merge_errors_on_seed_mismatch() {
         let mut a = GpsSketch::with_seed(0.5, 1);
         let b = GpsSketch::with_seed(0.5, 2);
-        a.merge_from(&b);
+        match a.try_merge_from(&b) {
+            Err(MergeError::SeedMismatch { lhs, rhs }) => {
+                assert_eq!(lhs, 1);
+                assert_eq!(rhs, 2);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     #[test]
-    #[should_panic(expected = "HH capacity mismatch")]
-    fn merge_requires_matching_hh_capacity() {
+    fn try_merge_errors_on_hh_mismatch() {
         let mut a = GpsSketch::with_heavy_hitters(0.5, 0, 2);
         let b = GpsSketch::with_seed(0.5, 0);
+        match a.try_merge_from(&b) {
+            Err(MergeError::HeavyCapacityMismatch { lhs, rhs }) => {
+                assert_eq!(lhs, Some(2));
+                assert_eq!(rhs, None);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_merge_errors_on_alpha_mismatch() {
+        let mut a = GpsSketch::with_seed(0.51, 1);
+        let b = GpsSketch::with_seed(0.5, 1);
+        match a.try_merge_from(&b) {
+            Err(MergeError::AlphaMismatch { lhs, rhs }) => {
+                assert_close(lhs, 0.51, 1e-12);
+                assert_close(rhs, 0.5, 1e-12);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn merge_from_still_panics_on_mismatch() {
+        let mut a = GpsSketch::with_seed(0.5, 1);
+        let b = GpsSketch::with_seed(0.5, 2);
         a.merge_from(&b);
     }
 

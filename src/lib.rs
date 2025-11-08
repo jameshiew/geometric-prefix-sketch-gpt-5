@@ -32,4 +32,4 @@ mod sketch;
 mod tree;
 mod util;
 
-pub use sketch::GpsSketch;
+pub use sketch::{GpsSketch, MergeError};
