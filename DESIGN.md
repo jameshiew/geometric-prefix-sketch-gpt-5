@@ -78,7 +78,7 @@ Adds value `Δ` (often 1 for counting). Let `s` be the key, length `|s|`.
 
    * Update the **sampled** sum:
      `S(P) += Δ`  (we store the raw sampled total and scale only at query time)
-   * (Optional) Update `P`’s top-k compactor with the **remaining suffix** (or the full key), weight `Δ`. Only **positive** weights are inserted (`Δ \le 0` is ignored) so the summary stays insertion-only. The sketch therefore tracks a Bernoulli subsample at this depth; multiply reported weights by the inclusion factor used by that summary when displaying. Because the compactor is nonlinear (truncate-to-capacity), we simply add sampled weights and scale on readback; it does **not** inherit Misra-Gries frequency guarantees, only “keep the heaviest things we saw.”
+   * (Optional) Update `P`’s top-k compactor with the **remaining suffix after `P`**, weight `Δ`. Only **positive** weights are inserted (`Δ \le 0` is ignored) so the summary stays insertion-only. The sketch therefore tracks a Bernoulli subsample at this depth; multiply reported weights by the inclusion factor used by that summary when displaying. Because the compactor is nonlinear (truncate-to-capacity), we simply add sampled weights and scale on readback; it does **not** inherit Misra-Gries frequency guarantees, only “keep the heaviest things we saw.” The stored HH labels are suffixes relative to the node; concatenate `prefix + suffix` to reconstruct the original key.
 
 **Why is this unbiased?**
 For any fixed prefix (P) of length (\ell), a key under (P) contributes to `S(P)` **iff** (L \ge \ell), which happens with probability (q(\ell)=\alpha^{\ell-1}). If we define the estimated sum at query time as ( \widehat{A}(P) = S(P)/q(\ell) ), then for each key with contribution (\Delta),
@@ -123,13 +123,15 @@ Because (q(1)=1) for any (\alpha), depth‑1 totals are always exact. Raising (\
 
 At node `P`, query the local heavy-hitter sketch (updated only when `P` was touched, i.e., with probability (q(|P|)) per key). When the query ends **mid-edge**, append the remaining edge label first and then consult the downstream child’s summary; the summary’s depth is the child depth, not the user-specified prefix. Scale reported weights by \(1/q(d_{\text{summary}})\), where `d_summary` equals the depth of the node that owns the heavy-hitter sketch. Because these sketches are insertion-only, weights reported after deletions may diverge from the unbiased `estimate(P)` result.
 
-> Note: The bounded top-k compactor is **nonlinear** and insertion-only. Scaling its reported weights by \(1/q(d_{\text{summary}})\) adjusts magnitudes but does not make the top-k set itself unbiased. In practice, heavy items stay heavy under Bernoulli subsampling, and the compactor remains mergeable because we simply add shared suffixes and truncate back to capacity.
+If a node-level query lands exactly on a node that either lacks a heavy-hitter sketch or whose compactor is empty **and** the node has exactly one child, we “fall through” to that child: append the solo edge label, reuse the child’s HH summary, and scale by the child’s depth before returning completions. This avoids silent gaps for prefixes that collapse into deterministic chains while keeping branching nodes localized.
+
+> Note: The bounded top-k compactor is **nonlinear** and insertion-only. Scaling its reported weights by \(1/q(d_{\text{summary}})\) adjusts magnitudes but does not make the top-k set itself unbiased. In practice, heavy items stay heavy under Bernoulli subsampling, and the compactor remains mergeable because we add shared suffixes, allow the merged compactor to grow to at most about `2×capacity - 1`, and only then truncate (or whenever the compactor is explicitly compressed). That deferred compression keeps merges order-invariant while avoiding churn from repeated truncations.
 
 ### Heavy-hitter caveats (current behavior)
 
 - **Insertion-only summaries.** Negative deltas update the unbiased node counters but are ignored by the top-k compactor, so completions can temporarily overstate frequency after deletions. This matches `TopKCompactor::update` and is documented in the public API (`GpsSketch::add` docs).
 - **Mid-edge completions scale at the child depth.** When a query stops mid-edge, we append the remaining edge label, read the child’s summary, and multiply by \(1/q(\text{child depth})\). `mid_edge_top_completions_use_child_depth` asserts this scaling so completions stay consistent with `estimate()`.
-- **Merge = sum then truncate.** Heavy-hitter summaries merge by adding shared suffixes and re-truncating to capacity, keeping results order-invariant (`top_k_compactor_merge_is_order_invariant`). Expect small divergences from strict Misra-Gries guarantees; GPS intentionally prioritizes “keep the heaviest suffixes we saw” behavior.
+- **Merge = sum, then defer compression until ≈ `2×capacity`.** Heavy-hitter summaries merge by adding shared suffixes, appending any new suffixes, and only trimming once the compactor reaches `2·capacity` entries (or when callers explicitly compress). This keeps merges order-invariant (`top_k_compactor_merge_is_order_invariant`) while guaranteeing the working set never exceeds `2×capacity - 1` entries per node. Expect small divergences from strict Misra-Gries guarantees; GPS intentionally prioritizes “keep the heaviest suffixes we saw” behavior.
 
 ### Merge (distributed)
 
@@ -180,7 +182,7 @@ Every realized prefix lives either on a node (`S`) or inside an edge (`mid_sums[
 * **Arena allocation** for node/edge storage.
 * **Children**: for byte alphabets, a tiny 256-bit bitmap + packed child array is fast; for UTF-8 or general alphabets, a sorted small vector (binary search) is usually fine.
 
-**Hybrid trie (unit-byte promotion + compression).** Depths `0..PROMOTION_DEPTH` (the Rust crate fixes `PROMOTION_DEPTH = 4`) are stored as **unit-byte nodes** so every character has its own node. That keeps shallow prefixes exact and simplifies merges. Beyond that depth the trie switches to **compressed edges** with `mid_sums`, drastically shrinking memory for long suffixes. This is the only form of “promotion” implemented today—it’s **structural**, not a “set q(ℓ) = 1” toggle.
+**Hybrid trie (unit-byte promotion + compression).** Depths `0..PROMOTION_DEPTH` (the Rust crate fixes `PROMOTION_DEPTH = 4`) are stored as **unit-byte nodes** so every character has its own node. That keeps shallow prefixes exact and simplifies merges. Beyond that depth the trie switches to **compressed edges** with `mid_sums`, drastically shrinking memory for long suffixes. This is the only form of “promotion” implemented today—it’s **structural**, not a “set q(ℓ) = 1” toggle. Merges still preserve correctness but can materialize compressed edges even inside the promoted depths whenever the destination shard lacks a matching child for that byte. Inserts continue to enforce unit-byte nodes, and a post-merge normalization pass is optional if a workload needs the structural invariant restored.
 
 > Exact-maintenance (q=1) promotion is **future work**. Any design that maintains per-node q=1 must share the promotion set across shards; the current crate does not ship this feature and always uses the geometric sampler for every node beyond the structural promotion depth.
 
@@ -230,7 +232,8 @@ function insert(key, Δ, α=0.5):
         depth += number_of_chars_in(consumed)
         node.S += Δ                 // sampled (unscaled) accumulator
         if node.hh exists and Δ > 0:
-            node.hh.update(key, Δ)  // HH sketch only tracks positive deltas
+            node.hh.update(remaining_suffix_after_this_node(key, off), Δ)
+            // HH sketch stores suffix relative to this node
 ```
 
 ### Query pseudocode
@@ -314,7 +317,7 @@ function estimate_prefix_sum(prefix, α=0.5):
 * **Parameter choice.** Start with (\alpha=0.5). If you need higher fidelity at deeper levels (e.g., 3–5 chars), try 0.6–0.7; watch update cost ((1/(1-\alpha))).
 * **Integer ranges.** Implement a bit‑trie front end: a 64‑bit unsigned splits naturally into 64 levels; GPS updates only a constant expected number of levels; range queries decompose into (\le 2\log U) prefixes—sum their estimates.
 * **Bias/variance tuning.** You can make depth‑dependent (\alpha_\ell) (e.g., slower decay beyond depth 4) by reading more bits from the hash to sample from a *piecewise geometric* distribution; same analysis applies with (q(\ell)=\Pr[L\ge\ell]).
-* **Heavy hitters.** A truncate-to-capacity top-k compactor with capacity 8–16 per node gives good completions; scale estimates by \(1/q(d_{\text{summary}})\) where `d_summary` is the depth of the node that owns the summary (child depth for mid-edge prefixes). The summary is nonlinear and insertion-only, so scaling fixes magnitudes but not the set; if you need deterministic frequency guarantees or deletions, plug in a true Misra-Gries/SpaceSaving variant per node.
+* **Heavy hitters.** A truncate-to-capacity top-k compactor with capacity 8–16 per node gives good completions; it only trims once entries reach `≈ 2×capacity`, capping memory at `2×capacity - 1` items between compressions. Scale estimates by \(1/q(d_{\text{summary}})\) where `d_summary` is the depth of the node that owns the summary (child depth for mid-edge prefixes). The summary is nonlinear and insertion-only, so scaling fixes magnitudes but not the set; if you need deterministic frequency guarantees or deletions, plug in a true Misra-Gries/SpaceSaving variant per node.
 
 *Mid-edge HH behavior.* When a query prefix ends in the middle of a compressed edge, we first append the remaining edge label so we can consult the downstream node’s summary. Only the suffixes observed at that child participate—updates that stopped exactly at the mid-edge accumulator never enter that HH summary—so the completions you see are always of the form `prefix + remaining_edge + hh_suffix`.
 * **Promotion policy.** If you “promote” certain prefixes to exact maintenance (force \(q=1\)), keep the policy deterministic and shared across shards so merges stay unbiased.
@@ -381,7 +384,7 @@ function add(key s, Δ):
         depth += consumed_chars
         node.S += Δ                  // sampled accumulator
         if node.hh exists and Δ > 0:
-            node.hh.update(s, Δ)
+            node.hh.update(remaining_suffix_after_this_node(s, i), Δ)
 
 function estimate(prefix p):
     match = locate(prefix p)

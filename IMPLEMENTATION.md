@@ -23,9 +23,9 @@ public API surface minimal.
 | Geometric depth sampling (Horvitz–Thompson rescaling) | ✅ Implemented. | `GpsSketch::add` turns the XXH3-128 hash into a Q128 integer. For `α = 0.5` we take `1 + clz128(h)` (clamped at 129); for every other `α` we walk a precomputed table of fixed-point thresholds (`q128[d] = ⌊α^{d-1} · 2^128⌋`) up to 200 000 entries. Depths beyond that return `q = 0`, so queries deterministically return 0 rather than underflow. 
 | Deterministic hashing | ✅ Implemented. | `util::deterministic_hash` uses `xxh3_128_with_seed` so shards merge safely. `GpsSketch::default()` now sources a secure random seed; use `with_seed(alpha, seed)` when deterministic merging is required.
 | Constructors & seeding semantics | ✅ Implemented. | `GpsSketch::default()` → random seed (best for adversarial keys), `GpsSketch::with_seed(alpha, seed)` → explicit seed for shard merges, `GpsSketch::new(alpha)` → fixed seed `0` for legacy deterministic behavior. `with_heavy_hitters` forwards whichever seed you choose.
-| Hybrid trie (unit-byte promotion + compression) | ✅ Implemented (see `tree.rs`). | The first four byte positions (depths 1–4) use unit-byte nodes for exact shallow prefixes; deeper paths compress into single edges with `mid_sums`. This is structural promotion only—not per-node `q=1` promotion.
-| Heavy-hitter sketches per node | ✅ Optional. | A truncate-to-capacity top-k compactor stores the heaviest suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates and merges summaries by summing shared suffixes then truncating back to capacity. Only positive deltas feed the HH stream so completions never inherit negative mass.
-| Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. Heavy hitters reuse the same sum-then-truncate compactor merge so results are order-invariant. Callers must still match `alpha`, `hash_seed`, and HH capacity. The API enforces this: `try_merge_from` returns structured errors; `merge_from` panics on mismatches.
+| Hybrid trie (unit-byte promotion + compression) | ✅ Implemented (see `tree.rs`). | The first four byte positions (depths 1–4) use unit-byte nodes for exact shallow prefixes; deeper paths compress into single edges with `mid_sums`. This is structural promotion only—not per-node `q=1` promotion, and merges can temporarily reintroduce compressed edges inside those depths when the destination shard lacks a matching child. Correctness is unaffected; normalization is optional.
+| Heavy-hitter sketches per node | ✅ Optional. | A truncate-to-capacity top-k compactor stores the heaviest suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates and only trims once the compactor reaches `≈ 2×capacity`, so the working set never exceeds `2×capacity - 1` entries. Merges simply add shared suffixes, append new ones, and let the same deferred compression rule run. Only positive deltas feed the HH stream so completions never inherit negative mass.
+| Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. Heavy hitters reuse the same sum-and-defer compactor merge (add, allow temporary growth, then truncate when needed) so results are order-invariant. Callers must still match `alpha`, `hash_seed`, and HH capacity. The API enforces this: `try_merge_from` returns structured errors; `merge_from` panics on mismatches.
 | Pruning low-signal prefixes | ✅ `prune_by_estimate`. | Recurses through the trie, comparing the unbiased magnitude `|S / q(depth)|` (nodes + mid-edge buckets) against the threshold before deleting subtrees.
 | Examples/benchmarks | ✅ `examples/` + Criterion benches. | Provide runnable demos and performance harnesses.
 | Accuracy/integration testing | ✅ `tests/accuracy.rs`. | Ensures estimates align with exact counts on random data (with a tolerance for deep prefixes).
@@ -45,7 +45,7 @@ public API surface minimal.
 - **Advanced heavy-hitter logic (e.g., Count-Min per node):** the current truncate-to-`k` compactor is simple but sufficient for small `k`.
 - **Per-node exact maintenance (`q=1`) promotions:** highlighted in DESIGN.md as future work; the current crate only applies the structural promotion depth (unit-byte nodes through `PROMOTION_DEPTH`).
 - **Per-occurrence sampling mode:** not implemented. The crate hashes `(key, seed)` once per distinct key; adopting per-event randomness (e.g., hashing `(key, event_id)`) remains future work.
-- **Numerical safeguards near the depth cap:** the inclusion table already zeroes probabilities once they fall below the 128-bit fixed-point threshold, so high-depth queries deterministically return 0. Future work would explore log-space or higher-precision tables instead of the present “set `q=0` beyond the cap” rule.
+- **Numerical safeguards near the depth cap:** the inclusion table already zeroes probabilities once they fall below the 128-bit fixed-point threshold, so high-depth queries deterministically return 0. Future work would explore log-space or higher-precision tables instead of the present “set `q=0` beyond the cap” rule. Sampling uses Q128 thresholds while scaling uses `f64` probabilities derived from the same α, so the fixed-point vs. float mismatch stays negligible (covered by the accuracy tests).
 
 ## Justifications / trade-offs
 
@@ -59,6 +59,13 @@ labels with `mid_sums`. Rationale:
   preserves exactness and fast `contains_prefix` checks.
 - Compression beyond depth 4 dramatically reduces node count on path-heavy
   datasets (URLs, file paths).
+
+Merges preserve correctness but can materialize compressed edges even inside
+those first four depths whenever the destination trie lacks a matching child
+for the incoming byte. The lookup, update, and merge routines all handle that
+mixed structure, so the invariant is “enforced along inserts, best-effort after
+merges.” A normalization pass can restore canonical unit-byte nodes if a caller
+needs that shape guarantee.
 
 ### 2. Deterministic hashing via XXH3 (and sampler hygiene)
 DESIGN.md left hashing “implementation-specific.” We chose XXH3 (128-bit) for:
@@ -101,10 +108,12 @@ Original DESIGN only said “tiny heavy-hitter sketch”. Instead of a multi-row
 Count-Min, we keep a bounded top-k compactor backed by an auxiliary
 `HashMap<Vec<u8>, usize>` so updates stay `O(1)` even for arbitrary byte suffixes.
 Whenever the compactor grows to `2k` entries we select the `k` heaviest via
-`select_nth_unstable` and truncate. During shard merges we sum shared suffixes,
-append any new ones, then run the same truncate step, so merge order can’t
-perturb the heavy-hitter winners even though no strict Misra-Gries guarantees
-are claimed.
+`select_nth_unstable` and truncate, letting it float between `k` and `2k-1`
+entries the rest of the time. During shard merges we still sum shared suffixes
+and append new ones, but we defer compression until that same `2k` threshold is
+hit (or until we explicitly ask for it), so merge order can’t perturb the
+heavy-hitter winners and we avoid thrashing `select_nth_unstable` on every
+merge.
 
 ### 4. Merge strategy
 The first implementation replayed every prefix via `add_raw_sum`, which was
@@ -118,8 +127,9 @@ compressed-edge divergence correctly:
 - Children are cloned only when truly unique; otherwise we recurse into the
   shared node after **adding** the overlapping boundary accumulator to the child
   sum—no rescaling occurs.
-- Per-node heavy hitters reuse the same sum-then-truncate compactor merge,
-  keeping the HH summaries deterministic and order-invariant.
+- Per-node heavy hitters reuse the same sum-and-defer compactor merge (add,
+  allow temporary growth, then trim when the size reaches `2k`), keeping the HH
+  summaries deterministic and order-invariant.
 
 This keeps merge cost linear in the number of realized prefixes, guarantees the
 resulting trie stays compressed/canonical, and aligns with DESIGN.md’s “merge by
@@ -164,7 +174,8 @@ workload.
 
 - **Insertion-only summaries.** `TopKCompactor::update` ignores non-positive deltas, so HH weights can lag `estimate()` after deletions. Callers who need signed guarantees must provide a different sketch.
 - **Mid-edge queries scale at the child depth.** `top_completions` stitches the remaining edge label onto the prefix, consults the downstream node’s compactor, and multiplies by \(1/q(\text{child depth})\). `mid_edge_top_completions_use_child_depth` keeps this invariant honest.
-- **Merges = sum + truncate.** `top_k_compactor_merge_is_order_invariant` shows that HH merges simply add overlapping suffixes and re-truncate to capacity, so order doesn’t perturb results even though the summaries are nonlinear.
+- **Single-child fallthrough when HH data is missing.** If a query lands on a node whose HH compactor is absent or empty but that node has exactly one child, `top_completions` appends the child’s edge label, reuses the child’s compactor, and scales at the child depth so deterministic chains still return completions.
+- **Merges = sum, then defer compression until ≈ `2×capacity`.** `top_k_compactor_merge_is_order_invariant` shows that HH merges simply add overlapping suffixes, append new ones, and only trim once the compactor reaches the `2k` threshold (or when explicitly requested). Order doesn’t perturb results even though the summaries are nonlinear, and memory stays bounded by `2×capacity - 1` entries per node between compressions.
 
 ### 6. Examples & documentation
 To make the crate usable without reading the entire design paper, we added:
