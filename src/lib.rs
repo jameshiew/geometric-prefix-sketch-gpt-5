@@ -24,8 +24,17 @@
 //! // Merge sketches built on different shards (same alpha/seed).
 //! let mut shard = GpsSketch::with_seed(0.5, 42);
 //! shard.add("/api/v1/users", 1.0);
-//! sketch.merge_from(&shard);
+//! sketch.try_merge_from(&shard).unwrap();
 //! ```
+//!
+//! ## Notes
+//!
+//! - Heavy-hitter summaries are insertion-only. Negative deltas update
+//!   [`estimate`](GpsSketch::estimate) counts but do not evict entries from
+//!   [`GpsSketch::top_completions`], so short-lived divergence is expected.
+//! - Queries deeper than the realizable depth cap deterministically return `0`.
+//!   The cap is `129` levels when `alpha = 0.5` and otherwise equals the
+//!   precomputed inclusion-table limit documented in `DESIGN.md`.
 //!
 //! ## Seeding & mergeability
 //!
@@ -39,7 +48,7 @@
 //!   let mut a = GpsSketch::with_seed(0.5, 12345);
 //!   let mut b = GpsSketch::with_seed(0.5, 12345);
 //!   // ... ingest on each ...
-//!   a.merge_from(&b);
+//!   a.try_merge_from(&b).unwrap();
 //!   ```
 //! - [`GpsSketch::new`] remains for compatibility and uses a fixed seed `0`.
 //!   Prefer [`with_random_seed`](GpsSketch::with_random_seed) for standalone use
