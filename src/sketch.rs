@@ -15,6 +15,7 @@ use crate::tree::{PROMOTION_DEPTH, TopKCompactor, ensure_edge, visit_raw};
 #[cfg(test)]
 use crate::util::inclusion_prob;
 use crate::util::{InclusionTable, deterministic_hash};
+use getrandom::getrandom;
 use std::fmt;
 
 /// Geometric Prefix Sketch with deterministic per-key sampling.
@@ -69,7 +70,7 @@ impl std::error::Error for MergeError {}
 
 impl Default for GpsSketch {
     fn default() -> Self {
-        Self::new(0.5)
+        Self::with_random_seed(0.5)
     }
 }
 
@@ -78,15 +79,37 @@ impl GpsSketch {
     ///
     /// `alpha` controls the per-depth inclusion probability (higher values
     /// sample more prefixes per update but reduce variance on deep prefixes).
+    ///
+    /// This constructor uses a fixed, deterministic seed (`0`) to preserve
+    /// backwards compatibility. Prefer [`with_random_seed`](Self::with_random_seed)
+    /// for standalone use or [`with_seed`](Self::with_seed) when coordinating
+    /// merges across shards.
     pub fn new(alpha: f64) -> Self {
         Self::with_seed(alpha, 0)
     }
 
+    /// Creates a sketch with a cryptographically strong random seed.
+    ///
+    /// Use this when you do **not** need to merge sketches across shards or
+    /// processes. For mergeability, prefer [`with_seed`](Self::with_seed) and
+    /// share the same `(alpha, seed[, heavy_hitters_capacity])` everywhere.
+    pub fn with_random_seed(alpha: f64) -> Self {
+        let mut buf = [0u8; 8];
+        getrandom(&mut buf).expect("getrandom failed");
+        let mut hash_seed = u64::from_le_bytes(buf);
+        if hash_seed == 0 {
+            hash_seed = 0x9E37_79B9_7F4A_7C15u64;
+        }
+        Self::with_heavy_hitters_internal(alpha, hash_seed, None)
+    }
+
     /// Creates a sketch with explicit hash seed.
     ///
-    /// Use this when multiple shards must produce identical sampling decisions
-    /// so their sketches can be merged later. For adversarial workloads, pick a
-    /// non-guessable seed so attackers cannot predict sampling depths.
+    /// Required when multiple shards must produce identical sampling decisions
+    /// so their sketches can be merged later. Every shard that needs to merge
+    /// must share the same `(alpha, seed[, heavy_hitters_capacity])`. For
+    /// adversarial workloads, pick a non-guessable seed so attackers cannot
+    /// predict sampling depths.
     pub fn with_seed(alpha: f64, hash_seed: u64) -> Self {
         Self::with_heavy_hitters_internal(alpha, hash_seed, None)
     }
@@ -131,8 +154,8 @@ impl GpsSketch {
 
     /// Returns the deterministic hash seed.
     ///
-    /// All sketches that need to merge must share this seed (and the same
-    /// `alpha`).
+    /// All sketches that need to merge must share this seed as well as the
+    /// same `alpha` and heavy-hitter capacity.
     pub fn hash_seed(&self) -> u64 {
         self.hash_seed
     }

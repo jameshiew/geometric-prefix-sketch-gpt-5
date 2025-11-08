@@ -21,7 +21,7 @@ public API surface minimal.
 | DESIGN element | Status | Notes |
 | -------------- | ------ | ----- |
 | Geometric depth sampling (Horvitz–Thompson rescaling) | ✅ Implemented. | `GpsSketch::add` samples a max depth using XXH3-128 leading-zero counts (`α=0.5` realizable depths stop at 129) and, for general `α`, a precomputed inclusion table capped at 200 000 entries where deeper levels are defined to have `q=0`; queries rescale by `alpha^(depth-1)`.
-| Deterministic hashing | ✅ Implemented. | `util::deterministic_hash` uses `xxh3_128_with_seed` so shards merge safely.
+| Deterministic hashing | ✅ Implemented. | `util::deterministic_hash` uses `xxh3_128_with_seed` so shards merge safely. `GpsSketch::default()` now sources a secure random seed; use `with_seed(alpha, seed)` when deterministic merging is required.
 | Compressed radix trie with mid-edge mass | ✅ Implemented (see `tree.rs`). | Nodes hold `sum` plus edges with `label` and `mid_sums`. Node promotion depth currently hard-coded at 4 (`PROMOTION_DEPTH`).
 | Heavy-hitter sketches per node | ✅ Optional. | A truncate-to-capacity top-k compactor stores the heaviest suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates and merges summaries by summing shared suffixes then truncating back to capacity. Only positive deltas feed the HH stream so completions never inherit negative mass.
 | Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. Heavy hitters reuse the same sum-then-truncate compactor merge so results are order-invariant. Callers must still match `alpha`, `hash_seed`, and HH capacity (the code `assert!`s every merge).
@@ -60,6 +60,11 @@ When building shards independently, every sketch that will eventually merge
 must share both `alpha` and the `hash_seed`. Pick a non-guessable seed whenever
 adversarial keys might try to predict sampling depths; `GpsSketch::with_seed`
 is the intended entry point for that configuration.
+
+`GpsSketch::default()` now calls `with_random_seed`, which sources entropy via
+`getrandom` to defend against adversarial key selection. Switch to
+`with_seed(alpha, seed)` (and share that tuple across shards) whenever
+mergeability matters.
 
 Sampling now mirrors the design’s deterministic story exactly:
 

@@ -177,6 +177,7 @@ name = "geometric-prefix-sketch"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "getrandom",
  "rand",
  "xxhash-rust",
 ]
