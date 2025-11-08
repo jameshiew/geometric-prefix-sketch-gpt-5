@@ -12,7 +12,9 @@ use crate::tree::{MisraGries, PROMOTION_DEPTH, ensure_edge, visit_raw};
 use crate::tree::{
     Node, PrefixMatch, add_inner, locate_prefix, locate_raw_sum, merge_nodes, prune_node,
 };
-use crate::util::{deterministic_hash, inclusion_prob, probability_to_hash_threshold};
+#[cfg(test)]
+use crate::util::inclusion_prob;
+use crate::util::{InclusionTable, deterministic_hash};
 
 /// Geometric Prefix Sketch with deterministic per-key sampling.
 ///
@@ -23,7 +25,7 @@ use crate::util::{deterministic_hash, inclusion_prob, probability_to_hash_thresh
 /// [`hash_seed`](Self::hash_seed).
 #[derive(Clone, Debug)]
 pub struct GpsSketch {
-    alpha: f64,
+    depth_table: InclusionTable,
     hash_seed: u64,
     heavy_capacity: Option<usize>,
     root: Node,
@@ -70,8 +72,9 @@ impl GpsSketch {
     ) -> Self {
         assert!(alpha.is_finite());
         assert!((0.0..1.0).contains(&alpha));
+        let depth_table = InclusionTable::new(alpha);
         Self {
-            alpha,
+            depth_table,
             hash_seed,
             heavy_capacity,
             root: Node::new(heavy_capacity),
@@ -83,7 +86,7 @@ impl GpsSketch {
     /// `alpha` corresponds to the geometric inclusion probability `q(ℓ) =
     /// alpha^(ℓ-1)` used when sampling prefixes.
     pub fn alpha(&self) -> f64 {
-        self.alpha
+        self.depth_table.alpha()
     }
 
     /// Returns the deterministic hash seed.
@@ -125,10 +128,7 @@ impl GpsSketch {
     /// prefixes return `0`.
     pub fn estimate<K: AsRef<[u8]>>(&self, prefix: K) -> f64 {
         match self.raw_sum(prefix.as_ref()) {
-            Some((raw, depth)) => {
-                let q = inclusion_prob(self.alpha, depth);
-                if q == 0.0 { 0.0 } else { raw / q }
-            }
+            Some((raw, depth)) => self.scale_raw_estimate(raw, depth),
             None => 0.0,
         }
     }
@@ -176,7 +176,9 @@ impl GpsSketch {
     /// are appended. Updates that sampled only up to the mid-edge (without a
     /// suffix) never enter the downstream node’s summary, so they’re omitted
     /// from the heavy-hitter output unless per-position HH sketches are
-    /// enabled.
+    /// enabled. Mid-edge completions therefore only include suffixes observed
+    /// at the downstream node; pruned or unvisited tails are intentionally
+    /// absent.
     pub fn top_completions<K: AsRef<[u8]>>(&self, prefix: K, k: usize) -> Vec<(Vec<u8>, f64)> {
         if k == 0 {
             return Vec::new();
@@ -192,7 +194,7 @@ impl GpsSketch {
                     return direct;
                 }
                 let missing_summary = node.heavy.as_ref().map_or(true, |hh| hh.is_empty());
-                if missing_summary && node.children.len() == 1 {
+                if node.children.len() == 1 && (node.heavy.is_none() || missing_summary) {
                     let edge = &node.children[0];
                     return self.completions_from_summary(
                         prefix,
@@ -209,8 +211,8 @@ impl GpsSketch {
                 remaining_label,
                 depth,
             } => {
-                let scale_depth = depth + remaining_label.len();
-                self.completions_from_summary(prefix, remaining_label, child, scale_depth, k)
+                let child_depth = depth + remaining_label.len();
+                self.completions_from_summary(prefix, remaining_label, child, child_depth, k)
             }
         }
     }
@@ -223,7 +225,13 @@ impl GpsSketch {
         if min_abs_estimate <= 0.0 {
             return 0;
         }
-        prune_node(self.alpha, &mut self.root, 0, min_abs_estimate)
+        prune_node(
+            &self.depth_table,
+            self.heavy_capacity,
+            &mut self.root,
+            0,
+            min_abs_estimate,
+        )
     }
 
     /// Merges `other` into `self` by streaming raw sums from its trie.
@@ -232,7 +240,7 @@ impl GpsSketch {
     /// [`hash_seed`](Self::hash_seed), and heavy-hitter capacity. The merge is
     /// linear in the number of prefixes realized by `other`.
     pub fn merge_from(&mut self, other: &GpsSketch) {
-        assert!((self.alpha - other.alpha).abs() < 1e-12);
+        assert!((self.alpha() - other.alpha()).abs() < 1e-12);
         assert_eq!(self.hash_seed, other.hash_seed, "hash seed mismatch");
         assert_eq!(
             self.heavy_capacity, other.heavy_capacity,
@@ -245,19 +253,30 @@ impl GpsSketch {
         locate_raw_sum(&self.root, prefix, 0)
     }
 
+    fn scale_raw_estimate(&self, raw: f64, depth: usize) -> f64 {
+        if depth > self.depth_table.max_realizable_depth() {
+            return 0.0;
+        }
+        let inv = self.depth_table.inv_prob(depth);
+        if inv == 0.0 { 0.0 } else { raw * inv }
+    }
+
     fn completions_from_summary(
         &self,
         base_prefix: &[u8],
         forced_suffix: &[u8],
         node: &Node,
-        scale_depth: usize,
+        summary_depth: usize,
         k: usize,
     ) -> Vec<(Vec<u8>, f64)> {
         let Some(sketch) = &node.heavy else {
             return Vec::new();
         };
-        let q = inclusion_prob(self.alpha, scale_depth);
-        let scale = if q == 0.0 { 0.0 } else { 1.0 / q };
+        let inv = if summary_depth > self.depth_table.max_realizable_depth() {
+            0.0
+        } else {
+            self.depth_table.inv_prob(summary_depth)
+        };
         let mut items: Vec<_> = sketch
             .top_k(k)
             .into_iter()
@@ -267,7 +286,7 @@ impl GpsSketch {
                 full.extend_from_slice(base_prefix);
                 full.extend_from_slice(forced_suffix);
                 full.extend_from_slice(&suffix);
-                let est = if scale == 0.0 { 0.0 } else { weight * scale };
+                let est = if inv == 0.0 { 0.0 } else { weight * inv };
                 (full, est)
             })
             .collect();
@@ -282,8 +301,7 @@ impl GpsSketch {
         prefix: &mut Vec<u8>,
         out: &mut Vec<(Vec<u8>, f64)>,
     ) {
-        let q = inclusion_prob(self.alpha, depth);
-        let estimate = if q == 0.0 { 0.0 } else { node.sum / q };
+        let estimate = self.scale_raw_estimate(node.sum, depth);
         out.push((prefix.clone(), estimate));
         for edge in &node.children {
             for (i, &byte) in edge.label.iter().enumerate() {
@@ -293,8 +311,7 @@ impl GpsSketch {
                     self.collect_estimates(&edge.child, new_depth, prefix, out);
                 } else {
                     let raw = edge.mid_sums[i];
-                    let q_mid = inclusion_prob(self.alpha, new_depth);
-                    let est = if q_mid == 0.0 { 0.0 } else { raw / q_mid };
+                    let est = self.scale_raw_estimate(raw, new_depth);
                     out.push((prefix.clone(), est));
                 }
                 prefix.pop();
@@ -364,21 +381,23 @@ impl GpsSketch {
         if max_depth == 0 {
             return 0;
         }
-        if max_depth == 1 {
+        let depth_cap = max_depth.min(self.depth_table.max_realizable_depth());
+        if depth_cap == 0 {
+            return 0;
+        }
+        if depth_cap == 1 {
             return 1;
         }
-        if (self.alpha - 0.5).abs() < f64::EPSILON {
+        if self.depth_table.is_half_sampler() {
             let leading = hash.leading_zeros() as usize;
-            return (1 + leading).min(max_depth);
+            return (1 + leading).min(depth_cap);
         }
         let mut limit = 1;
-        let mut prob = 1.0f64;
-        for depth in 2..=max_depth {
-            prob *= self.alpha;
-            if prob <= f64::MIN_POSITIVE {
+        for depth in 2..=depth_cap {
+            let threshold = self.depth_table.q128(depth);
+            if threshold == 0 {
                 break;
             }
-            let threshold = probability_to_hash_threshold(prob);
             if hash < threshold {
                 limit = depth;
             } else {
@@ -408,6 +427,7 @@ impl GpsSketch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::RngCore;
     use rand::prelude::*;
     use rand::rngs::StdRng;
     use std::collections::HashMap;
@@ -452,6 +472,16 @@ mod tests {
                 key_cmp
             }
         });
+    }
+
+    #[test]
+    fn unreachable_depth_estimates_to_zero() {
+        let mut sketch = GpsSketch::with_seed(0.9, 7);
+        let max_depth = sketch.depth_table.max_realizable_depth();
+        let target_depth = max_depth + 5;
+        let key = vec![b'x'; target_depth];
+        sketch.add_raw_sum(&key, 12.0);
+        assert_eq!(sketch.estimate(&key), 0.0);
     }
 
     #[test]
@@ -521,6 +551,21 @@ mod tests {
         let budget = sketch.debug_prefix_budget(key);
         for _ in 0..10 {
             assert_eq!(sketch.debug_prefix_budget(key), budget);
+        }
+    }
+
+    #[test]
+    fn prefix_budget_matches_across_instances() {
+        let mut rng = StdRng::seed_from_u64(99);
+        let sketch_a = GpsSketch::with_seed(0.73, 123);
+        let sketch_b = GpsSketch::with_seed(0.73, 123);
+        for _ in 0..200 {
+            let len = rng.gen_range(4..32);
+            let mut key = vec![0u8; len];
+            rng.fill_bytes(&mut key);
+            let budget_a = sketch_a.debug_prefix_budget(&key);
+            let budget_b = sketch_b.debug_prefix_budget(&key);
+            assert_eq!(budget_a, budget_b);
         }
     }
 
@@ -737,6 +782,16 @@ mod tests {
         assert_eq!(tops[0].0, b"abcdefgh".to_vec());
         let point_estimate = sketch.estimate("abcdefgh");
         assert_close(tops[0].1, point_estimate, 1e-9);
+    }
+
+    #[test]
+    fn mid_edge_scaling_holds_for_general_alpha() {
+        let mut sketch = GpsSketch::with_heavy_hitters(0.7, 3, 8);
+        force_full_depth_insert(&mut sketch, b"mnopqrst", 10.0);
+        let tops = sketch.top_completions("mnopq", 1);
+        assert_eq!(tops.len(), 1);
+        assert_eq!(tops[0].0, b"mnopqrst".to_vec());
+        assert_close(tops[0].1, sketch.estimate("mnopqrst"), 1e-9);
     }
 
     #[test]

@@ -1,4 +1,5 @@
-use crate::util::inclusion_prob;
+use crate::util::InclusionTable;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 pub(crate) const PROMOTION_DEPTH: usize = 4;
@@ -168,7 +169,8 @@ impl MisraGries {
     }
 
     fn trim_to_capacity(&mut self) {
-        if self.entries.len() > self.capacity {
+        let limit = self.capacity.saturating_mul(2);
+        if limit > 0 && self.entries.len() >= limit {
             self.compress_to_capacity();
         }
     }
@@ -186,13 +188,15 @@ impl MisraGries {
             if let Some(&idx) = self.index.get(key) {
                 self.entries[idx].weight += weight;
             } else {
+                let owned = key.to_vec();
                 self.entries.push(HeavyEntry {
-                    key: key.to_vec(),
+                    key: owned.clone(),
                     weight,
                 });
+                self.index.insert(owned, self.entries.len() - 1);
             }
         }
-        self.compress_to_capacity();
+        self.trim_to_capacity();
     }
 
     fn compress_to_capacity(&mut self) {
@@ -204,10 +208,9 @@ impl MisraGries {
             self.rebuild_index();
             return;
         }
-        self.entries.sort_by(|a, b| {
-            b.weight
-                .partial_cmp(&a.weight)
-                .unwrap_or(std::cmp::Ordering::Equal)
+        let idx = self.capacity;
+        self.entries.select_nth_unstable_by(idx, |a, b| {
+            b.weight.partial_cmp(&a.weight).unwrap_or(Ordering::Equal)
         });
         self.entries.truncate(self.capacity);
         self.rebuild_index();
@@ -327,39 +330,63 @@ pub(crate) fn locate_prefix<'a>(
     None
 }
 
-pub(crate) fn prune_node(alpha: f64, node: &mut Node, depth: usize, threshold: f64) -> usize {
+pub(crate) fn prune_node(
+    table: &InclusionTable,
+    heavy_capacity: Option<usize>,
+    node: &mut Node,
+    depth: usize,
+    threshold: f64,
+) -> usize {
     let mut removed = 0;
     let mut i = 0;
     while i < node.children.len() {
-        let (child_est, max_mid_est, child_depth) = {
+        let (child_depth, child_est, max_mid_est, last_keep_mid) = {
             let edge = &node.children[i];
             let child_depth = depth + edge.label.len();
-            let q_child = inclusion_prob(alpha, child_depth);
+            let q_child = table.prob(child_depth);
             let child_est = if q_child == 0.0 {
                 0.0
             } else {
                 edge.child.sum / q_child
             };
-            let mut max_mid_est: f64 = 0.0;
+            let mut max_mid_est = 0.0;
+            let mut last_keep_mid = None;
             for (offset, raw) in edge.mid_sums.iter().enumerate() {
                 let mid_depth = depth + offset + 1;
-                let q_mid = inclusion_prob(alpha, mid_depth);
+                let q_mid = table.prob(mid_depth);
                 if q_mid == 0.0 {
                     continue;
                 }
                 let estimate = raw / q_mid;
-                max_mid_est = max_mid_est.max(estimate.abs());
+                let abs_est = estimate.abs();
+                if abs_est >= threshold {
+                    last_keep_mid = Some(offset);
+                }
+                if abs_est > max_mid_est {
+                    max_mid_est = abs_est;
+                }
             }
-            (child_est, max_mid_est, child_depth)
+            (child_depth, child_est, max_mid_est, last_keep_mid)
         };
 
+        let keep_child = child_est.abs() >= threshold;
         if child_est.abs().max(max_mid_est) < threshold {
             let edge = node.children.remove(i);
             removed += edge.child.count_prefixes();
             removed += edge.mid_sums.len();
+        } else if !keep_child {
+            if let Some(keep_idx) = last_keep_mid {
+                removed += trim_edge_tail(&mut node.children[i], keep_idx, heavy_capacity);
+                i += 1;
+            } else {
+                let edge = node.children.remove(i);
+                removed += edge.child.count_prefixes();
+                removed += edge.mid_sums.len();
+            }
         } else {
             removed += prune_node(
-                alpha,
+                table,
+                heavy_capacity,
                 node.children[i].child.as_mut(),
                 child_depth,
                 threshold,
@@ -368,6 +395,18 @@ pub(crate) fn prune_node(alpha: f64, node: &mut Node, depth: usize, threshold: f
         }
     }
     removed
+}
+
+fn trim_edge_tail(edge: &mut Edge, keep_idx: usize, heavy_capacity: Option<usize>) -> usize {
+    let trimmed_mid = edge.mid_sums.len().saturating_sub(keep_idx + 1);
+    let promoted_sum = edge.mid_sums[keep_idx];
+    edge.label.truncate(keep_idx + 1);
+    edge.mid_sums.truncate(keep_idx);
+
+    let old_child = std::mem::replace(&mut edge.child, Box::new(Node::new(heavy_capacity)));
+    let removed_nodes = old_child.count_prefixes();
+    edge.child.sum = promoted_sum;
+    trimmed_mid + removed_nodes
 }
 
 #[cfg(test)]
@@ -537,9 +576,14 @@ mod tests {
         edge.child.sum = 0.01;
         root.children.push(edge);
 
-        let removed = prune_node(0.5, &mut root, 0, 5.0);
-        assert_eq!(removed, 0);
+        let table = InclusionTable::new(0.5);
+        let removed = prune_node(&table, None, &mut root, 0, 5.0);
+        assert_eq!(removed, 2);
         assert_eq!(root.children.len(), 1);
+        let kept = &root.children[0];
+        assert_eq!(kept.label, vec![b'a']);
+        assert!(kept.mid_sums.is_empty());
+        assert!((kept.child.sum - 10.0).abs() < 1e-9);
     }
 
     #[test]
@@ -548,10 +592,10 @@ mod tests {
 
         let mut keeper = Edge {
             label: vec![b'k', b'e', b'e', b'p'],
-            mid_sums: vec![2.0, 0.0, 0.0],
+            mid_sums: vec![2.0, 1.5, 1.0],
             child: Box::new(Node::new(None)),
         };
-        keeper.child.sum = 0.05;
+        keeper.child.sum = 5.0;
         root.children.push(keeper);
 
         let mut dropped = Edge {
@@ -560,11 +604,62 @@ mod tests {
             child: Box::new(Node::new(None)),
         };
         dropped.child.sum = 0.01;
+        let dropped_expected = dropped.mid_sums.len() + dropped.child.count_prefixes();
         root.children.push(dropped);
 
-        let removed = prune_node(0.5, &mut root, 0, 1.0);
-        assert_eq!(removed, 2); // 1 mid-edge accumulator + 1 leaf node
+        let table = InclusionTable::new(0.5);
+        let removed = prune_node(&table, None, &mut root, 0, 1.0);
+        assert_eq!(removed, dropped_expected);
         assert_eq!(root.children.len(), 1);
+    }
+
+    #[test]
+    fn prune_trims_low_signal_tail() {
+        let mut root = Node::new(None);
+        let mut edge = Edge {
+            label: vec![b'a', b'b', b'c', b'd', b'e'],
+            mid_sums: vec![5.0, 0.6, 0.01, 0.005],
+            child: Box::new(Node::new(None)),
+        };
+        edge.child.sum = 0.002;
+        root.children.push(edge);
+
+        let table = InclusionTable::new(0.5);
+        let removed = prune_node(&table, None, &mut root, 0, 1.0);
+        assert_eq!(removed, 3);
+        let kept = &root.children[0];
+        assert_eq!(kept.label, vec![b'a', b'b']);
+        assert_eq!(kept.mid_sums.len(), 1);
+        assert!((kept.child.sum - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn misra_gries_defers_compression_until_double_capacity() {
+        let mut sketch = MisraGries::new(2);
+        sketch.update(b"a", 1.0);
+        sketch.update(b"b", 1.0);
+        sketch.update(b"c", 1.0);
+        assert_eq!(sketch.entries.len(), 3);
+        sketch.update(b"d", 1.0);
+        assert!(sketch.entries.len() <= 2);
+    }
+
+    #[test]
+    fn misra_gries_merge_delays_compression() {
+        let mut left = MisraGries::new(4);
+        let mut right = MisraGries::new(4);
+        for i in 0..4 {
+            let key = vec![b'a', i as u8];
+            left.update(&key, 1.0);
+        }
+        for i in 0..3 {
+            let key = vec![b'b', i as u8];
+            right.update(&key, 1.0);
+        }
+        left.merge_from(&right);
+        assert_eq!(left.entries.len(), 7);
+        left.update(b"extra", 1.0);
+        assert!(left.entries.len() <= 4);
     }
 
     #[test]

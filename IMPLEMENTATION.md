@@ -23,8 +23,8 @@ public API surface minimal.
 | Geometric depth sampling (Horvitz–Thompson rescaling) | ✅ Implemented. | `GpsSketch::add` samples a max depth using XXH3-derived uniform bits and `sample_level_for_hash`; queries rescale by `alpha^(depth-1)`.
 | Deterministic hashing | ✅ Implemented. | `util::deterministic_hash` uses `xxh3_128_with_seed` so shards merge safely.
 | Compressed radix trie with mid-edge mass | ✅ Implemented (see `tree.rs`). | Nodes hold `sum` plus edges with `label` and `mid_sums`. Node promotion depth currently hard-coded at 4 (`PROMOTION_DEPTH`).
-| Heavy-hitter sketches per node | ✅ Optional. | A Misra-Gries summary stores top suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates and merges summaries via `MisraGries::merge_from`.
-| Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. Heavy hitters reuse the Misra-Gries merge so results are order-invariant.
+| Heavy-hitter sketches per node | ✅ Optional. | A Misra-Gries summary stores top suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates and merges summaries via `MisraGries::merge_from`. Only positive deltas feed the HH stream so completions never inherit negative mass.
+| Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. Heavy hitters reuse the Misra-Gries merge so results are order-invariant. Callers must still match `alpha`, `hash_seed`, and HH capacity (the code `assert!`s every merge).
 | Pruning low-signal prefixes | ✅ `prune_by_estimate`. | Recurses through the trie, dropping subtrees once their scaled estimate falls below threshold.
 | Examples/benchmarks | ✅ `examples/` + Criterion benches. | Provide runnable demos and performance harnesses.
 | Accuracy/integration testing | ✅ `tests/accuracy.rs`. | Ensures estimates align with exact counts on random data (with a tolerance for deep prefixes).
@@ -66,10 +66,10 @@ Sampling now mirrors the design’s deterministic story exactly:
 - For `α = 0.5` (the default), `sample_level_for_hash` uses just the
   number of leading zeros in the 128-bit hash (`1 + clz(hash)`), capped by the
   key length. No floating point math, no branches.
-- For general `α`, `probability_to_hash_threshold` converts
-  `α^(ℓ-1)` into a `u128` threshold via f64 mantissa/exponent decomposition, so
-  every shard makes identical keep/drop decisions without the rounding loss of a
-  naïve `probability * u128::MAX as f64` multiply.
+- For general `α`, we precompute a monotone table of Q128 thresholds derived
+  from `α^(ℓ-1)` so runtime sampling boils down to comparing `hash < q128[ℓ]`
+  with zero floating-point work. Every shard therefore makes identical
+  keep/drop decisions without depending on platform rounding quirks.
 
 ### 3. Misra-Gries index map & merges
 Original DESIGN only said “tiny heavy-hitter sketch”. Instead of a multi-row
@@ -127,6 +127,11 @@ To make the crate usable without reading the entire design paper, we added:
 - Crate-level doc comment with runnable snippet.
 - Extensive rustdoc on each public method (detailing scaling, merges, etc.).
 
+## Toolchain
+
+The crate targets Rust 2024 (see `Cargo.toml`). Make sure your toolchain is
+new enough to enable that edition before running builds or tests.
+
 ## Running the project
 
 - `cargo test` – runs unit, doctest, and integration suites.
@@ -150,7 +155,9 @@ Users shouldn’t need to know whether a prefix stops at a node or mid-edge. The
 new `locate_prefix` helper lets `top_completions` stitch the remainder of a
 compressed edge onto the requested prefix before applying the Misra-Gries
 summary attached to the downstream node. Callers can now ask for completions of
-`"abcde"` even if the trie stores `"def"` as a single edge.
+`"abcde"` even if the trie stores `"def"` as a single edge. Only completions
+observed at that downstream node are surfaced, so mid-edge HH output excludes
+speculative or pruned tails by construction.
 
 ### 8. Pointer safety in trie navigation
 
