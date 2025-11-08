@@ -111,9 +111,9 @@ Whenever the compactor grows to `2k` entries we select the `k` heaviest via
 `select_nth_unstable` and truncate, letting it float between `k` and `2k-1`
 entries the rest of the time. During shard merges we still sum shared suffixes
 and append new ones, but we defer compression until that same `2k` threshold is
-hit (or until we explicitly ask for it), so merge order can’t perturb the
-heavy-hitter winners and we avoid thrashing `select_nth_unstable` on every
-merge.
+hit (i.e., the next compression trigger at ≈ `2×capacity`), so merge order can’t
+perturb the heavy-hitter winners and we avoid thrashing `select_nth_unstable` on
+every merge.
 
 ### 4. Merge strategy
 The first implementation replayed every prefix via `add_raw_sum`, which was
@@ -175,7 +175,9 @@ workload.
 - **Insertion-only summaries.** `TopKCompactor::update` ignores non-positive deltas, so HH weights can lag `estimate()` after deletions. Callers who need signed guarantees must provide a different sketch.
 - **Mid-edge queries scale at the child depth.** `top_completions` stitches the remaining edge label onto the prefix, consults the downstream node’s compactor, and multiplies by \(1/q(\text{child depth})\). `mid_edge_top_completions_use_child_depth` keeps this invariant honest.
 - **Single-child fallthrough when HH data is missing.** If a query lands on a node whose HH compactor is absent or empty but that node has exactly one child, `top_completions` appends the child’s edge label, reuses the child’s compactor, and scales at the child depth so deterministic chains still return completions.
-- **Merges = sum, then defer compression until ≈ `2×capacity`.** `top_k_compactor_merge_is_order_invariant` shows that HH merges simply add overlapping suffixes, append new ones, and only trim once the compactor reaches the `2k` threshold (or when explicitly requested). Order doesn’t perturb results even though the summaries are nonlinear, and memory stays bounded by `2×capacity - 1` entries per node between compressions.
+- **Merges = sum, then defer compression until ≈ `2×capacity`.** `top_k_compactor_merge_is_order_invariant` shows that HH merges simply add overlapping suffixes, append new ones, and only trim once the compactor reaches the `2k` threshold on its own. Order doesn’t perturb results even though the summaries are nonlinear, and memory stays bounded by `2×capacity - 1` entries per node between compressions.
+
+There is no user-facing “compress now” API; compaction is deferred and occurs automatically at the ≈ `2×capacity` threshold.
 
 ### 6. Examples & documentation
 To make the crate usable without reading the entire design paper, we added:
