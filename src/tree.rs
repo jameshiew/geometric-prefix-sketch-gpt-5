@@ -25,11 +25,10 @@ impl Node {
         byte: u8,
         heavy_capacity: Option<usize>,
     ) -> &mut Node {
-        if let Some(idx) = self
-            .children
-            .iter()
-            .position(|edge| edge.label.len() == 1 && edge.label[0] == byte)
-        {
+        if let Some(idx) = self.children.iter().position(|edge| edge.label[0] == byte) {
+            if self.children[idx].label.len() > 1 {
+                self.children[idx].split(1, heavy_capacity);
+            }
             #[cfg(debug_assertions)]
             self.assert_unique_first_bytes();
             return self.children[idx].child.as_mut();
@@ -604,6 +603,12 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 mod tests {
     use super::*;
 
+    fn raw_value(node: &Node, prefix: &[u8]) -> f64 {
+        locate_raw_sum(node, prefix, 0)
+            .unwrap_or_else(|| panic!("missing prefix {:?}", prefix))
+            .0
+    }
+
     #[test]
     fn edge_add_weight_updates_midpoints_incrementally() {
         let cases = [
@@ -732,5 +737,82 @@ mod tests {
         left.merge_from(&right);
         assert!(left.entries.len() <= 32);
         assert_eq!(left.index.len(), left.entries.len());
+    }
+
+    #[test]
+    fn ensure_unit_child_splits_compressed_children_without_duplication() {
+        let mut root = Node::new(None);
+        root.sum = 11.0;
+        let mut compressed = Edge {
+            label: vec![b'a', b'b'],
+            mid_sums: vec![7.0],
+            child: Box::new(Node::new(None)),
+        };
+        compressed.child.sum = 4.0;
+        let mut deep = Edge::new(vec![b'c'], None);
+        deep.child.sum = 1.25;
+        compressed.child.children.push(deep);
+        root.children.push(compressed);
+
+        let before_a = raw_value(&root, b"a");
+        let before_ab = raw_value(&root, b"ab");
+        let before_abc = raw_value(&root, b"abc");
+
+        {
+            let split_child = root.ensure_unit_child(b'a', None);
+            assert_eq!(split_child.sum, before_a);
+        }
+
+        let after_a = raw_value(&root, b"a");
+        let after_ab = raw_value(&root, b"ab");
+        let after_abc = raw_value(&root, b"abc");
+
+        assert_eq!(
+            root.children
+                .iter()
+                .filter(|edge| edge.label[0] == b'a')
+                .count(),
+            1
+        );
+        assert_eq!(root.children[0].label, vec![b'a']);
+        assert_eq!(before_a, after_a);
+        assert_eq!(before_ab, after_ab);
+        assert_eq!(before_abc, after_abc);
+    }
+
+    #[test]
+    fn add_inner_reuses_split_unit_children_at_promoted_depths() {
+        let mut root = Node::new(None);
+        let mut compressed = Edge {
+            label: vec![b'a', b'b'],
+            mid_sums: vec![5.0],
+            child: Box::new(Node::new(None)),
+        };
+        compressed.child.sum = 2.0;
+        let mut tail = Edge::new(vec![b'c'], None);
+        tail.child.sum = 3.5;
+        compressed.child.children.push(tail);
+        root.children.push(compressed);
+
+        let before_a = raw_value(&root, b"a");
+        let before_ab = raw_value(&root, b"ab");
+        let before_abc = raw_value(&root, b"abc");
+
+        super::add_inner(&mut root, b"axy", 0, 2, 0.0, None);
+
+        let after_a = raw_value(&root, b"a");
+        let after_ab = raw_value(&root, b"ab");
+        let after_abc = raw_value(&root, b"abc");
+
+        assert_eq!(
+            root.children
+                .iter()
+                .filter(|edge| edge.label[0] == b'a')
+                .count(),
+            1
+        );
+        assert_eq!(before_a, after_a);
+        assert_eq!(before_ab, after_ab);
+        assert_eq!(before_abc, after_abc);
     }
 }

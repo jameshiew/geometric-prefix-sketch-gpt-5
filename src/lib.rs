@@ -29,9 +29,9 @@
 //!
 //! ## Notes
 //!
-//! - Heavy-hitter summaries are insertion-only. Negative deltas update
-//!   [`estimate`](GpsSketch::estimate) counts but do not evict entries from
-//!   [`GpsSketch::top_completions`], so short-lived divergence is expected.
+//! - **Top-k summaries are insertion-only; negative updates do not remove HH
+//!   mass, so [`GpsSketch::top_completions`] can temporarily diverge from
+//!   [`GpsSketch::estimate`] on workloads with deletions.**
 //! - Queries deeper than the realizable depth cap deterministically return `0`.
 //!   The cap is `129` levels when `alpha = 0.5` and otherwise equals the
 //!   precomputed inclusion-table limit documented in `DESIGN.md`.
