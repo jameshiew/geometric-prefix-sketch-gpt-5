@@ -174,11 +174,14 @@ impl GpsSketch {
     /// estimated weight. Prefixes that end mid-edge in the compressed trie are
     /// automatically completed through that edge before heavy-hitter suffixes
     /// are appended. Updates that sampled only up to the mid-edge (without a
-    /// suffix) never enter the downstream node’s summary, so they’re omitted
+    /// suffix) never enter the downstream node's summary, so they're omitted
     /// from the heavy-hitter output unless per-position HH sketches are
     /// enabled. Mid-edge completions therefore only include suffixes observed
     /// at the downstream node; pruned or unvisited tails are intentionally
-    /// absent.
+    /// absent. Returned strings always equal `prefix` plus any remaining edge
+    /// label (when the prefix ends mid-edge) plus the heavy-hitter suffix, and
+    /// their weights are scaled using the inclusion probability at the summary
+    /// depth of that downstream node.
     pub fn top_completions<K: AsRef<[u8]>>(&self, prefix: K, k: usize) -> Vec<(Vec<u8>, f64)> {
         if k == 0 {
             return Vec::new();
@@ -239,6 +242,11 @@ impl GpsSketch {
     /// Both sketches must share the same [`alpha`](Self::alpha),
     /// [`hash_seed`](Self::hash_seed), and heavy-hitter capacity. The merge is
     /// linear in the number of prefixes realized by `other`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `alpha`, `hash_seed`, or heavy-hitter capacity differ because
+    /// mismatched samplers would otherwise corrupt the estimates.
     pub fn merge_from(&mut self, other: &GpsSketch) {
         assert!((self.alpha() - other.alpha()).abs() < 1e-12);
         assert_eq!(self.hash_seed, other.hash_seed, "hash seed mismatch");
@@ -495,6 +503,25 @@ mod tests {
     }
 
     #[test]
+    fn depth_one_counts_are_exact_for_general_alpha() {
+        let configs = [(0.7, 11u64), (0.9, 29u64)];
+        for &(alpha, seed) in &configs {
+            let mut sketch = GpsSketch::with_seed(alpha, seed);
+            let mut rng = StdRng::seed_from_u64(seed.wrapping_mul(17));
+            let mut counts: HashMap<u8, f64> = HashMap::new();
+            for _ in 0..4_000 {
+                let mut key = vec![0u8; 16];
+                rng.fill_bytes(&mut key);
+                sketch.add(&key, 1.0);
+                *counts.entry(key[0]).or_insert(0.0) += 1.0;
+            }
+            for (byte, count) in counts {
+                assert_close(sketch.estimate([byte]), count, 1e-12);
+            }
+        }
+    }
+
+    #[test]
     fn merge_matches_single_pass() {
         let mut left = GpsSketch::with_seed(0.5, 42);
         let mut right = GpsSketch::with_seed(0.5, 42);
@@ -532,6 +559,25 @@ mod tests {
         merged.merge_from(&right);
 
         for prefix in ["abcde", "abcdef", "abcdex"] {
+            assert_close(merged.estimate(prefix), combined.estimate(prefix), 1e-9);
+        }
+    }
+
+    #[test]
+    fn merge_boundary_mid_carries_overlap() {
+        let mut left = GpsSketch::with_seed(0.5, 19);
+        let mut right = GpsSketch::with_seed(0.5, 19);
+        let mut combined = GpsSketch::with_seed(0.5, 19);
+
+        force_full_depth_insert(&mut left, b"abcdefg", 2.0);
+        force_full_depth_insert(&mut right, b"abcdexy", 3.0);
+        force_full_depth_insert(&mut combined, b"abcdefg", 2.0);
+        force_full_depth_insert(&mut combined, b"abcdexy", 3.0);
+
+        let mut merged = left.clone();
+        merged.merge_from(&right);
+
+        for prefix in ["abcd", "abcde", "abcdef", "abcdex"] {
             assert_close(merged.estimate(prefix), combined.estimate(prefix), 1e-9);
         }
     }
@@ -774,6 +820,66 @@ mod tests {
     }
 
     #[test]
+    fn heavy_hitters_return_original_keys_for_prefix() {
+        let mut sketch = GpsSketch::with_heavy_hitters(0.5, 21, 16);
+        let keys: &[&[u8]] = &[
+            b"/abmid_edge_alpha",
+            b"/abmid_edge_beta",
+            b"/abshort",
+            b"/abdeeper_branch_value",
+        ];
+        for (idx, key) in keys.iter().enumerate() {
+            force_full_depth_insert(&mut sketch, key, (idx + 1) as f64);
+        }
+        let completions = sketch.top_completions("/ab", keys.len());
+        assert_eq!(completions.len(), keys.len());
+        for (full, _) in completions {
+            assert!(full.starts_with(b"/ab"));
+            assert!(
+                keys.iter()
+                    .any(|original| original.as_ref() == full.as_slice()),
+                "missing completion {:?}",
+                full
+            );
+        }
+    }
+
+    #[test]
+    fn heavy_hitter_labels_survive_merge() {
+        let keys: &[(&[u8], f64)] = &[
+            (b"/abcommon_tail_cat", 5.0),
+            (b"/abcommon_tail_dog", 4.0),
+            (b"/abbranch_left", 3.0),
+            (b"/abbranch_right", 2.5),
+            (b"/abdepth_mid_edge_suffix", 2.0),
+            (b"/abx_trailing", 1.5),
+        ];
+        let mut left = GpsSketch::with_heavy_hitters(0.5, 8, 16);
+        let mut right = GpsSketch::with_heavy_hitters(0.5, 8, 16);
+        let mut combined = GpsSketch::with_heavy_hitters(0.5, 8, 16);
+        for (idx, &(key, weight)) in keys.iter().enumerate() {
+            if idx % 2 == 0 {
+                force_full_depth_insert(&mut left, key, weight);
+            } else {
+                force_full_depth_insert(&mut right, key, weight);
+            }
+            force_full_depth_insert(&mut combined, key, weight);
+        }
+        let mut merged = left.clone();
+        merged.merge_from(&right);
+
+        let mut merged_top = merged.top_completions("/ab", keys.len());
+        let mut combined_top = combined.top_completions("/ab", keys.len());
+        sort_completions(&mut merged_top);
+        sort_completions(&mut combined_top);
+        assert_eq!(merged_top.len(), combined_top.len());
+        for (lhs, rhs) in merged_top.iter().zip(combined_top.iter()) {
+            assert_eq!(lhs.0, rhs.0);
+            assert_close(lhs.1, rhs.1, 1e-9);
+        }
+    }
+
+    #[test]
     fn mid_edge_top_completions_use_child_depth() {
         let mut sketch = GpsSketch::with_heavy_hitters(0.5, 11, 8);
         force_full_depth_insert(&mut sketch, b"abcdefgh", 8.0);
@@ -792,6 +898,18 @@ mod tests {
         assert_eq!(tops.len(), 1);
         assert_eq!(tops[0].0, b"mnopqrst".to_vec());
         assert_close(tops[0].1, sketch.estimate("mnopqrst"), 1e-9);
+    }
+
+    #[test]
+    fn mid_edge_completions_concatenate_remaining_label() {
+        let mut sketch = GpsSketch::with_heavy_hitters(0.6, 5, 8);
+        force_full_depth_insert(&mut sketch, b"abcdefgh", 6.0);
+        let prefix = b"abcde";
+        let tops = sketch.top_completions(prefix, 2);
+        assert_eq!(tops.len(), 1);
+        assert!(tops[0].0.starts_with(prefix));
+        assert_eq!(tops[0].0, b"abcdefgh".to_vec());
+        assert_close(tops[0].1, sketch.estimate("abcdefgh"), 1e-9);
     }
 
     #[test]
@@ -869,6 +987,43 @@ mod tests {
         let sketch = GpsSketch::new(0.5);
         let level = sketch.debug_sample_level_from_bits(0);
         assert!(level >= 120);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn general_alpha_sampler_matches_tail_probabilities() {
+        const TRIALS: usize = 200_000;
+        for &(alpha, seed) in &[(0.7, 31u64), (0.9, 37u64)] {
+            let sketch = GpsSketch::new(alpha);
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut tail_counts = vec![0usize; 65];
+            for _ in 0..TRIALS {
+                let bits = ((rng.next_u64() as u128) << 64) | (rng.next_u64() as u128);
+                let level = sketch.debug_sample_level_from_bits(bits).min(64);
+                for depth in 1..=level {
+                    tail_counts[depth] += 1;
+                }
+            }
+            for depth in 1..=64 {
+                let empirical = tail_counts[depth] as f64 / TRIALS as f64;
+                let expected = alpha.powi((depth - 1) as i32);
+                assert!(
+                    (empirical - expected).abs() <= 2e-3,
+                    "alpha={alpha}, depth={depth}, empirical={empirical}, expected={expected}"
+                );
+            }
+            let mut prev = u128::MAX;
+            for depth in 1..=64 {
+                let threshold = sketch.depth_table.q128(depth);
+                assert!(
+                    threshold <= prev,
+                    "q128 not monotone at depth {depth}: {} > {}",
+                    threshold,
+                    prev
+                );
+                prev = threshold;
+            }
+        }
     }
 
     #[test]

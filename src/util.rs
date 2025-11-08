@@ -1,7 +1,9 @@
 use xxhash_rust::xxh3::xxh3_128_with_seed;
 
 const HALF_MAX_DEPTH: usize = (u128::BITS as usize) + 1;
-const MAX_TABLE_DEPTH: usize = 4_000_000;
+/// Hard upper bound on the inclusion table depth so extremely large α values
+/// cannot allocate unbounded state.
+const MAX_TABLE_DEPTH: usize = 200_000;
 
 pub(crate) fn deterministic_hash(bytes: &[u8], seed: u64) -> u128 {
     xxh3_128_with_seed(bytes, seed)
@@ -29,6 +31,15 @@ fn fast_pow(mut base: f64, mut exp: usize) -> f64 {
     acc
 }
 
+/// Lookup table for geometric inclusion probabilities.
+///
+/// `prob(0)` and `prob(1)` always evaluate to `1.0`. Deeper levels decay
+/// geometrically and the table is capped at [`MAX_TABLE_DEPTH`] to keep memory
+/// usage predictable. Calling [`prob`](InclusionTable::prob) or
+/// [`inv_prob`](InclusionTable::inv_prob) with a depth greater than
+/// [`max_realizable_depth`](InclusionTable::max_realizable_depth) deliberately
+/// returns `0.0`, which means estimates deeper than the realizable depth are
+/// defined to be zero.
 #[derive(Clone, Debug)]
 pub(crate) struct InclusionTable {
     alpha: f64,

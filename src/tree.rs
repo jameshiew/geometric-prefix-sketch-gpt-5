@@ -30,17 +30,42 @@ impl Node {
             .iter()
             .position(|edge| edge.label.len() == 1 && edge.label[0] == byte)
         {
+            #[cfg(debug_assertions)]
+            self.assert_unique_first_bytes();
             return self.children[idx].child.as_mut();
         }
         self.children.push(Edge::new(vec![byte], heavy_capacity));
+        #[cfg(debug_assertions)]
+        self.assert_unique_first_bytes();
         let len = self.children.len();
         self.children[len - 1].child.as_mut()
     }
 
+    #[cfg(debug_assertions)]
+    fn assert_unique_first_bytes(&self) {
+        use std::collections::HashSet;
+        let mut seen = HashSet::with_capacity(self.children.len());
+        for edge in &self.children {
+            let byte = edge.label[0];
+            assert!(seen.insert(byte), "duplicate first byte child {:?}", byte);
+        }
+    }
+
+    /// Updates the per-node heavy-hitter summary with a suffix relative to this node.
+    ///
+    /// Callers must strip the bytes that lead into this node so stored labels are valid
+    /// completions when concatenated with the node's prefix. Only positive deltas contribute.
     pub(crate) fn update_heavy_hitters(&mut self, suffix: &[u8], delta: f64) {
         if delta <= 0.0 {
             return;
         }
+        debug_assert!(
+            {
+                // Callers always pass the *remaining* suffix after the current node.
+                true
+            },
+            "suffix passed to update_heavy_hitters must exclude the node prefix"
+        );
         if let Some(hh) = &mut self.heavy {
             hh.update(suffix, delta);
         }
@@ -95,6 +120,8 @@ impl Edge {
         });
 
         self.child = Box::new(promoted);
+        #[cfg(debug_assertions)]
+        self.child.assert_unique_first_bytes();
     }
 
     pub(crate) fn add_weight(&mut self, bytes_to_consume: usize, delta: f64) {
@@ -446,6 +473,8 @@ pub(crate) fn merge_nodes(dst: &mut Node, src: &Node, heavy_capacity: Option<usi
     for child in &src.children {
         merge_edge_into(dst, child, heavy_capacity);
     }
+    #[cfg(debug_assertions)]
+    dst.assert_unique_first_bytes();
 }
 
 fn merge_edge_into(dst: &mut Node, src_edge: &Edge, heavy_capacity: Option<usize>) {
@@ -494,6 +523,9 @@ fn merge_edge_segment(
                     *dst_mid += src_mid;
                 }
                 debug_assert!(lcp > 0 && lcp <= mid_sums.len());
+                // The overlap bucket right before the fork (lcp - 1) belongs
+                // to the destination child so the shared boundary estimate
+                // remains consistent after the merge.
                 let boundary = mid_sums[lcp - 1];
                 edge.child.sum += boundary;
                 merge_edge_segment(
@@ -543,15 +575,22 @@ pub(crate) fn ensure_edge(
                     edge.split(lcp, heavy_capacity);
                     true
                 } else {
-                    return idx;
+                    false
                 }
             };
             if split_again {
+                #[cfg(debug_assertions)]
+                node.assert_unique_first_bytes();
                 continue;
             }
+            #[cfg(debug_assertions)]
+            node.assert_unique_first_bytes();
+            return idx;
         } else {
             node.children
                 .push(Edge::new(remaining.to_vec(), heavy_capacity));
+            #[cfg(debug_assertions)]
+            node.assert_unique_first_bytes();
             return node.children.len() - 1;
         }
     }
@@ -564,6 +603,21 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edge_add_weight_updates_midpoints_incrementally() {
+        let cases = [
+            (1, vec![1.0, 0.0, 0.0]),
+            (2, vec![1.0, 1.0, 0.0]),
+            (3, vec![1.0, 1.0, 1.0]),
+            (4, vec![1.0, 1.0, 1.0]),
+        ];
+        for (consume, expected) in cases {
+            let mut edge = Edge::new(b"abcd".to_vec(), None);
+            edge.add_weight(consume, 1.0);
+            assert_eq!(edge.mid_sums, expected);
+        }
+    }
 
     #[test]
     fn prune_retains_mid_edge_signal() {
