@@ -29,8 +29,8 @@ Consider keys as strings over an alphabet (bytes, UTF‑8 code units, bits for i
 
 Each realized trie node `P` stores:
 
-* `B_sum(P)`: a **rescaled** accumulator for the sum/count under prefix `P`.
-* (Optional) a tiny **heavy‑hitter sketch** (e.g., Misra-Gries or a 3–4 row Count‑Min) to extract frequent *extensions* under `P` for autocomplete.
+* `S(P)`: a **sampled (unscaled)** accumulator for the sum/count under prefix `P`. We add `Δ` to `S(P)` whenever `P` is visited; the unbiased estimate divides by the inclusion probability \(q(|P|)\) at query time.
+* (Optional) a tiny **heavy‑hitter sketch** (e.g., Misra-Gries or a 3–4 row Count‑Min) to extract frequent *extensions* under `P` for autocomplete. This sketch only sees the Bernoulli subsample induced by depth `|P|`.
 * Child pointers (we recommend a **compressed trie**/radix node to pack runs of characters).
 
 We fix a geometric parameter `α ∈ (0,1)` that tunes cost vs. accuracy (think `α = 1/2` by default).
@@ -50,6 +50,8 @@ L = 1 + \left\lfloor \frac{\ln u}{\ln \alpha} \right\rfloor,
 ]
 truncated at (|key|). (With (\alpha=1/2), this is just **1 + number‑of‑leading‑zeros** in the hash until the first 1‑bit—exactly like HyperLogLog’s `rho` function—capped by the key length. That makes `L` sampling **branchless** and fast.)
 
+> Use a **keyed** 64‑bit hash (e.g., SplitMix64/SipHash with a shared seed). All shards must share the seed to stay deterministic, and the keying defends against adversarial keys.
+
 ---
 
 ## Operations
@@ -62,12 +64,12 @@ Adds value `Δ` (often 1 for counting). Let `s` be the key, length `|s|`.
 2. Compute `L = sample_level(h, α)` as above; set `L = min(L, |s|)`.
 3. Walk the trie from the root for the **first `L` characters** of `s`, creating compressed nodes if missing. At each visited prefix node `P` (depth `ℓ`):
 
-   * Update the **rescaled** sum:
-     `B_sum(P) += Δ`  (note: we store the *rescaled* quantity directly; see “Query”)
-   * (Optional) Update `P`’s heavy‑hitter sketch with the **remaining suffix** (or the full key), weight `Δ`.
+   * Update the **sampled** sum:
+     `S(P) += Δ`  (we store the raw sampled total and scale only at query time)
+   * (Optional) Update `P`’s heavy‑hitter sketch with the **remaining suffix** (or the full key), weight `Δ`. The sketch therefore tracks a Bernoulli subsample at this depth; multiply reported weights by \(1/q(|P|)\) when displaying. If the sketch is **nonlinear** (Misra‑Gries/SpaceSaving), consider inserting weight \(Δ/q(|P|)\) so its internal thresholds mirror the unbiased totals; linear sketches (Count‑Min, CountSketch) can safely stay unscaled until query time.
 
 **Why is this unbiased?**
-For any fixed prefix (P) of length (\ell), a key under (P) contributes to `B_sum(P)` **iff** (L \ge \ell), which happens with probability (q(\ell)=\alpha^{,\ell-1}). If we define the estimated sum at query time as ( \widehat{A}(P) = B_sum(P)/q(\ell) ), then for each key with contribution (\Delta),
+For any fixed prefix (P) of length (\ell), a key under (P) contributes to `S(P)` **iff** (L \ge \ell), which happens with probability (q(\ell)=\alpha^{\ell-1}). If we define the estimated sum at query time as ( \widehat{A}(P) = S(P)/q(\ell) ), then for each key with contribution (\Delta),
 [
 \mathbb{E}\left[\frac{\mathbf{1}[L\ge \ell] \cdot \Delta}{q(\ell)}\right] = \Delta,
 ]
@@ -85,39 +87,42 @@ Same as insert (deterministic `L`), but subtract.
 1. Traverse the trie to node `P` (if missing ⇒ estimate 0).
 2. Return
    [
-   \widehat{A}(P) = \frac{B_sum(P)}{q(|P|)} = \frac{B_sum(P)}{\alpha^{,|P|-1}}.
+   \widehat{A}(P) = \frac{S(P)}{q(|P|)} = \frac{S(P)}{\alpha^{|P|-1}}.
    ]
 
-**Variance & relative error.**
-If `Δ=1` (counting), let (N_P) be the true number of keys under prefix (P) (length (\ell)). Each contributes a Bernoulli with inclusion prob (q(\ell)) and weight (1/q(\ell)). Thus
+**Variance & relative error.** Let (q = q(|P|) = \alpha^{|P|-1}).
+
+*If sampling is per occurrence* (each arrival has its own stable event ID and hash), arrivals with values (\Delta_i) behave like standard Bernoulli HT sampling:
 [
-\mathrm{Var}[\widehat{A}(P)] = N_P \cdot \frac{1-q(\ell)}{q(\ell)}.
-]
-Relative RMSE (\approx \sqrt{\frac{1-q(\ell)}{q(\ell) , N_P}}).
+\mathrm{Var}[\widehat{A}(P)] = \frac{1-q}{q}\sum_i \Delta_i^2.
+\]
+For pure counts (\Delta_i=1), this collapses to (N_P \cdot \frac{1-q}{q}) and relative RMSE (\approx \sqrt{\frac{1-q}{qN_P}}).
 
-* For (\alpha=1/2): (q(\ell) = 2^{-(\ell-1)}).
+*In this library’s default per‑key deterministic sampling*, every occurrence of key (s) under (P) moves together. Let (w_s) be the total weight collected by that key (counts ⇒ (w_s=f_s)). Then
+[
+\mathrm{Var}[\widehat{A}(P)] = \frac{1-q}{q}\sum_s w_s^2,\qquad
+\mathrm{rRMSE} \approx \sqrt{\frac{1-q}{q\,N_{\text{eff}}}},
+\]
+where (N_{\text{eff}} = (\sum_s w_s)^2 / \sum_s w_s^2) is the **effective** number of equally weighted keys. The simpler (N_P) formula only holds when each key appears once.
 
-  * Depth 1: (q=1) ⇒ **exact** (variance 0) — nice property for top‑level categories.
-  * Depth 2: relative RMSE (\approx 1/\sqrt{N_P}).
-  * Depth 3: relative RMSE (\approx \sqrt{3}/\sqrt{N_P}), etc.
-
-You can pick (\alpha) to tune the depth‑accuracy curve vs. per‑update cost:
-
-* Higher (\alpha) (e.g., 0.7): better accuracy at deeper prefixes but higher update cost ((1/(1-\alpha))).
-* Lower (\alpha) (e.g., 0.4): cheaper updates, less accuracy for deep prefixes.
+Because (q(1)=1) for any (\alpha), depth‑1 totals are always exact. Raising (\alpha) improves accuracy for deeper depths at the cost of higher expected update work ((1/(1-\alpha))); lowering (\alpha) does the opposite.
 
 ### Top‑k under a prefix
 
 At node `P`, query the local heavy‑hitter sketch (updated only when `P` was touched, i.e., with probability (q(|P|)) per key). The sketch naturally tracks frequent **completions** under `P`. You can scale counts by (1/q(|P|)) to unbias.
 
+> Note: Misra‑Gries/SpaceSaving are **nonlinear**. Scaling their reported weights by \(1/q(|P|)\) adjusts magnitudes but does not make the top‑k set itself unbiased. In practice, heavy items stay heavy under Bernoulli subsampling, and these sketches remain mergeable (standard Misra‑Gries merge = sum then compress).
+
 ### Merge (distributed)
 
 Because inclusion decisions and levels are **deterministic from the key hash**, two GPS structures built on disjoint streams can be merged by **pointwise addition** of:
 
-* `B_sum` at corresponding trie nodes
+* `S` at corresponding trie nodes
 * (optional) heavy‑hitter sketches (mergeable sketches or simple sum of Count‑Min tables)
 
 No global coordination is required.
+
+> **Promotion caveat:** if you “promote” select prefixes to exact maintenance (forcing \(q=1\) for them), keep that list deterministic and shared across shards; otherwise merges could introduce bias.
 
 ---
 
@@ -130,7 +135,7 @@ Use a **compressed radix node** (like a succinct Patricia trie):
 ```text
 struct Node {
   string edge_label;        // compressed run (could be slice into an arena)
-  double B_sum;             // or fixed-point / 64-bit int if counts are big
+  double S;                 // sampled (unscaled) sum; int64 works if counts only
   Children children;        // sorted small vector or array-mapped (HAMT-like)
   Optional<HHSketch> hh;    // tiny Misra-Gries or CM-Sketch (optional)
 }
@@ -149,6 +154,24 @@ L = min(L, key_length);
 
 (Or use standard “position of first 1” trick; any deterministic geometric sampler works.)
 
+> **Avoiding the 64‑bit cap.** `1 + clz(h)` caps \(L\) at 65, so extremely long strings would never sample deeper. To keep the full geometric tail, stream additional deterministic blocks (e.g., from a keyed XOF/PRF seeded by the key) and continue counting leading zeros until you encounter a 1‑bit:
+
+```c
+int sample_level_extended(Key key) {
+    XofStream xs = keyed_xof(key, seed);
+    int L = 1;
+    for (;;) {
+        uint64_t block = xs.next_u64();
+        int z = clz(block);
+        L += z;
+        if (z < 64) break;
+    }
+    return L;
+}
+```
+
+For general (\alpha), either map a uniform (u) via (\lfloor \log(u) / \log(\alpha)\rfloor + 1) or use a tiny lookup table for (q(\ell)=\alpha^{\ell-1}) to avoid `log`.
+
 ### Insert pseudocode
 
 ```pseudo
@@ -164,9 +187,9 @@ function insert(key, Δ, α=0.5):
         (node, consumed) = descend_or_create(node, key[off:])
         off   += consumed
         depth += number_of_chars_in(consumed)
-        node.B_sum += Δ             // rescaled accumulator
+        node.S += Δ                 // sampled (unscaled) accumulator
         if node.hh exists:
-            node.hh.update(key, Δ)  // optional heavy hitters
+            node.hh.update(key, Δ)  // HH sketch runs on this Bernoulli subsample
 ```
 
 ### Query pseudocode
@@ -177,10 +200,10 @@ function estimate_prefix_sum(prefix, α=0.5):
     if node == null: return 0
     depth = length_in_chars(prefix)
     q = α^(depth-1)
-    return node.B_sum / q
+    return node.S / q
 ```
 
-> **Note on scaling:** To avoid large divisions, you can store `B_sum_scaled(P) = B_sum(P) * (α^(|P|-1))` and return `B_sum_scaled(P) / (α^(|P|-1)) / (α^(|P|-1))`—but that complicates integers. In practice, using `double` for `B_sum` is fine for analytics. If exact integer arithmetic is required, maintain per‑depth integer accumulators and multiply at query time by a precomputed reciprocal table.
+> **Note on scaling:** We store `S(P)` as the raw sampled total (ints or f64). At query time we divide by \(q(|P|)\). If you need integer‑only outputs, precompute reciprocals (or fixed‑point factors) per depth and apply them on read.
 
 ---
 
@@ -218,7 +241,7 @@ function estimate_prefix_sum(prefix, α=0.5):
 4. **Experiments:**
 
    * Vary `α ∈ {0.4, 0.5, 0.6, 0.7}`; measure **update throughput**, **memory**, and **prefix error** by depth.
-   * Plot relative RMSE vs. true count (N_P) and depth (\ell); confirm ( \sim \sqrt{(1-q)/ (q N_P)}).
+   * Plot relative RMSE vs. depth (\ell) and **effective size** \(N_{\text{eff}} = (\sum_s f_s)^2 / \sum_s f_s^2\); confirm (\sim \sqrt{(1-q)/(q N_{\text{eff}})}) under per-key sampling.
    * **Latency** of `estimate_prefix_sum` is just trie lookup (microseconds).
    * **Merging:** build two sketches on split halves, merge, compare to single‑pass sketch and ground truth.
 5. **A/B vs. baselines:**
@@ -233,7 +256,7 @@ function estimate_prefix_sum(prefix, α=0.5):
 
 * **Insert/Delete:** (O(1)) expected node touches; worst‑case (O(|key|)) if `L` hits full length (rare, geometric tail).
 * **Query:** (O(|prefix|)) to traverse the compressed path; answer in (O(1)) after lookup.
-* **Memory:** Number of realized nodes is the number of **distinct prefixes that were ever sampled**, which is (O(n \cdot \mathbb{E}[L]) = O(n/(1-\alpha))) in the worst case (typically far less due to shared prefixes). Each node stores a double and small metadata; optional tiny sketches add fixed overhead.
+* **Memory:** Number of realized nodes is the number of **distinct prefixes that were ever sampled**, which is (O(n \cdot \mathbb{E}[L]) = O(n/(1-\alpha))) in the worst case (typically far less thanks to shared prefixes). Here (n) is the number of **distinct keys** ever observed. Each node stores a counter and small metadata; optional tiny sketches add fixed overhead.
 
 ---
 
@@ -242,7 +265,8 @@ function estimate_prefix_sum(prefix, α=0.5):
 * **Parameter choice.** Start with (\alpha=0.5). If you need higher fidelity at deeper levels (e.g., 3–5 chars), try 0.6–0.7; watch update cost ((1/(1-\alpha))).
 * **Integer ranges.** Implement a bit‑trie front end: a 64‑bit unsigned splits naturally into 64 levels; GPS updates only a constant expected number of levels; range queries decompose into (\le 2\log U) prefixes—sum their estimates.
 * **Bias/variance tuning.** You can make depth‑dependent (\alpha_\ell) (e.g., slower decay beyond depth 4) by reading more bits from the hash to sample from a *piecewise geometric* distribution; same analysis applies with (q(\ell)=\Pr[L\ge\ell]).
-* **Heavy hitters.** Misra-Gries with capacity 8–16 per node gives good top‑k completions; scale estimates by (1/q(|P|)).
+* **Heavy hitters.** Misra-Gries with capacity 8–16 per node gives good top-k completions; scale estimates by (1/q(|P|)). These sketches are nonlinear, so scaling fixes magnitudes but not the set itself—good enough because heavy items stay heavy under the subsample.
+* **Promotion policy.** If you “promote” certain prefixes to exact maintenance (force \(q=1\)), keep the policy deterministic and shared across shards so merges stay unbiased.
 * **Persistence.** Because decisions are hash‑deterministic, you can **replay** updates idempotently and snapshot/restore cheaply.
 * **Concurrency.** Shard by first byte/edge; merge node‑local counters with lock‑free atomics; the per‑node work is tiny.
 
@@ -254,6 +278,7 @@ function estimate_prefix_sum(prefix, α=0.5):
 
   * Raising (\alpha) (spend more CPU), or
   * **On‑demand promotion:** if a prefix is frequently queried, start *exactly* maintaining that node: on future updates, always touch it (set (q(\ell)=1) for that specific node).
+* **Repeated keys inflate variance under per‑key sampling.** When the same key appears many times, all of its occurrences are either sampled or not together, so variance scales with \(\sum_s w_s^2\). Mitigate by bumping \(\alpha\), promoting hot prefixes, or (if you have a stable per‑event identifier) hashing on `(key, event_id)` to get per‑occurrence sampling.
 * **Counts only (sums of nonnegative values).** For signed updates (turnstile with cancellations), the estimator remains unbiased, but variance adds; use wider counters or float.
 
 ---
@@ -295,14 +320,14 @@ function add(key s, Δ):
         (node, consumed_chars) = descend_or_create(node, s, i)
         i     += bytes(consumed_chars)
         depth += consumed_chars
-        node.B_sum += Δ              // rescaled accumulator
+        node.S += Δ                  // sampled accumulator
         // optional: node.hh.update(s, Δ)
 
 function estimate(prefix p):
     node = find(prefix p)
     if node == null: return 0
     depth = |p|
-    return node.B_sum / q(depth)
+    return node.S / q(depth)
 ```
 
 You can implement this directly and validate it today.
