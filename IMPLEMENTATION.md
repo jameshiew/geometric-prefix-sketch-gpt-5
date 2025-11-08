@@ -23,9 +23,9 @@ public API surface minimal.
 | Geometric depth sampling (Horvitz–Thompson rescaling) | ✅ Implemented. | `GpsSketch::add` turns the XXH3-128 hash into a Q128 integer. For `α = 0.5` we take `1 + clz128(h)` (clamped at 129); for every other `α` we walk a precomputed table of fixed-point thresholds (`q128[d] = ⌊α^{d-1} · 2^128⌋`) up to 200 000 entries. Depths beyond that return `q = 0`, so queries deterministically return 0 rather than underflow. 
 | Deterministic hashing | ✅ Implemented. | `util::deterministic_hash` uses `xxh3_128_with_seed` so shards merge safely. `GpsSketch::default()` now sources a secure random seed; use `with_seed(alpha, seed)` when deterministic merging is required.
 | Constructors & seeding semantics | ✅ Implemented. | `GpsSketch::default()` → random seed (best for adversarial keys), `GpsSketch::with_seed(alpha, seed)` → explicit seed for shard merges, `GpsSketch::new(alpha)` → fixed seed `0` for legacy deterministic behavior. `with_heavy_hitters` forwards whichever seed you choose.
-| Hybrid trie (unit-byte promotion + compression) | ✅ Implemented (see `tree.rs`). | Depths 0–4 use unit-byte nodes for exact shallow prefixes; deeper paths compress into single edges with `mid_sums`. This is structural promotion only—not per-node `q=1` promotion.
+| Hybrid trie (unit-byte promotion + compression) | ✅ Implemented (see `tree.rs`). | The first four byte positions (depths 1–4) use unit-byte nodes for exact shallow prefixes; deeper paths compress into single edges with `mid_sums`. This is structural promotion only—not per-node `q=1` promotion.
 | Heavy-hitter sketches per node | ✅ Optional. | A truncate-to-capacity top-k compactor stores the heaviest suffixes; `GpsSketch::with_heavy_hitters` toggles them. Implementation keeps a `HashMap<Vec<u8>, usize>` index for `O(1)` updates and merges summaries by summing shared suffixes then truncating back to capacity. Only positive deltas feed the HH stream so completions never inherit negative mass.
-| Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. Heavy hitters reuse the same sum-then-truncate compactor merge so results are order-invariant. Callers must still match `alpha`, `hash_seed`, and HH capacity (the code `assert!`s every merge).
+| Merge via deterministic sampling | ✅ Implemented structurally. | `tree::merge_nodes` walks both tries, summing nodes/edges in place instead of replaying inserts. Heavy hitters reuse the same sum-then-truncate compactor merge so results are order-invariant. Callers must still match `alpha`, `hash_seed`, and HH capacity. The API enforces this: `try_merge_from` returns structured errors; `merge_from` panics on mismatches.
 | Pruning low-signal prefixes | ✅ `prune_by_estimate`. | Recurses through the trie, comparing the unbiased magnitude `|S / q(depth)|` (nodes + mid-edge buckets) against the threshold before deleting subtrees.
 | Examples/benchmarks | ✅ `examples/` + Criterion benches. | Provide runnable demos and performance harnesses.
 | Accuracy/integration testing | ✅ `tests/accuracy.rs`. | Ensures estimates align with exact counts on random data (with a tolerance for deep prefixes).
@@ -133,7 +133,7 @@ added `tests/accuracy.rs`, which:
 
 - Builds a large sketch from random keys.
 - Tracks exact counts for shallow prefixes.
-- Asserts that depth-1 prefixes are exact (because `alpha=0.5` ⇒ `q(1)=1`).
+- Asserts that depth-1 prefixes are exact (`q(1)=1` for any α).
 - Enforces <15% relative error for high-support prefixes (≥200 true count).
 - Adds targeted regression coverage (`merge_splits_compressed_edges_when_needed`)
   so merges stay correct even when long suffixes diverge past

@@ -373,6 +373,8 @@ function add(key s, Δ):
     node = root
     depth = 0
     i = 0
+    // Root (depth 0) keeps q(0)=1, so update it unconditionally to keep total() exact.
+    node.S += Δ
     while depth < L:
         (node, consumed_chars) = descend_or_create(node, s, i)
         i     += bytes(consumed_chars)
