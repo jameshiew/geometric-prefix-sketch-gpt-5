@@ -1,4 +1,4 @@
-# geometric-sketch-prefix-gpt-5
+# geometric-prefix-sketch-gpt-5
 
 > ⚠️ **AI-Generated Experiment**
 >
